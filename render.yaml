@@ -9,13 +9,18 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.6
+      - key: REFRESH_TOKEN
+        generateValue: true          # Render generates a secure token for you
+      - key: SERVICE_URL
+        value: https://YOUR-SERVICE.onrender.com    # <-- set this after first deploy
 
   - type: cron
     name: nhl-predictor-daily-build
     env: python
-    schedule: "0 9 * * *"   # 09:00 UTC ≈ 3:00 AM Central most of the year
+    schedule: "0 9 * * *"            # 09:00 UTC ≈ 3:00am Central (DST note below)
     buildCommand: pip install -r requirements.txt
-    startCommand: python generate_daily.py
+    startCommand: >
+      bash -lc 'curl -fsS "$SERVICE_URL/refresh?token=$REFRESH_TOKEN" || python generate_daily.py'
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.6
