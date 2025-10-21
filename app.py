@@ -420,6 +420,10 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
             "home_record": records.get(home_key, ""),
             "away_record": records.get(away_key, ""),
             "local_time": fmt_local_time(g.start_local_dt),
+            "utc_time": (
+                g.start_local_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                if g.start_local_dt else ""
+            ),
             "game_type": g.game_type or "",
         })
     return preds
@@ -523,7 +527,7 @@ document.querySelectorAll('.time[data-utc]').forEach(el => {
       </div>
     </div>
     <div class="vs">
-      at <span class="time" data-utc="{p['utc_time']}">{p['local_time']}</span>
+      at <span class="time" data-utc="{p.get('utc_time','')}">{time_str}</span>
     </div>
     <div class="team home">
       <img class="logo" src="{p['home_logo']}" data-alts='{alts_home}' alt="{p['home_key']}" loading="lazy"/>
