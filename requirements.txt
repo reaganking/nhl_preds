@@ -1,9 +1,6 @@
 Flask==3.0.2
 gunicorn==21.2.0
-
-# Pin NumPy/SciPy combo that has prebuilt manylinux wheels on Render
 numpy==1.26.4
 scipy==1.11.4
-
 requests>=2.31.0
 tzdata>=2024.1
