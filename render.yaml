@@ -4,12 +4,18 @@ services:
     env: python
     plan: free
     region: ohio
-    buildCommand: ""
-    startCommand: python server.py
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app -w 2 -k gthread --threads 8 -t 120 -b 0.0.0.0:$PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.6
 
   - type: cron
     name: nhl-predictor-daily-build
     env: python
-    schedule: "0 9 * * *"   # 09:00 UTC ≈ 3:00am Central
-    buildCommand: ""
+    schedule: "0 9 * * *"   # 09:00 UTC ≈ 3:00 AM Central most of the year
+    buildCommand: pip install -r requirements.txt
     startCommand: python generate_daily.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.6
