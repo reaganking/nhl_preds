@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: nhl-predictor
+    env: python
+    plan: free
+    region: oregon
+    buildCommand: ""
+    startCommand: python server.py
+
+  - type: cron
+    name: nhl-predictor-daily-build
+    env: python
+    schedule: "0 11 * * *"   # 11:00 UTC ≈ 6:00am Central during Daylight Time
+    buildCommand: ""
+    startCommand: python generate_daily.py
