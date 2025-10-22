@@ -54,7 +54,7 @@ API_SCHEDULE_DATE = API_BASE + "/v1/schedule/{date}"   # YYYY-MM-DD
 API_SCORE_DATE    = API_BASE + "/v1/score/{date}"      # YYYY-MM-DD
 API_STANDINGS_NOW = API_BASE + "/v1/standings/now"
 
-CENTRAL_TZ = ZoneInfo("America/Chicago"
+CENTRAL_TZ = ZoneInfo("America/Chicago")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
