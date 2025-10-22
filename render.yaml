@@ -24,3 +24,14 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.6
+  - type: cron
+    name: nhl-predictor-keep-alive
+    env: python
+    schedule: "*/30 * * * *"     # every 30 minutes
+    buildCommand: ""
+    startCommand: >
+      bash -lc 'curl -fsS "$SERVICE_URL/health" || true'
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.6
+
