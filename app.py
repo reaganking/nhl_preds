@@ -2,19 +2,18 @@
 """
 Daily NHL predictor + season backtester using api-web.nhle.com
 
-Run:
-  # Predict today (America/Chicago)
+Run locally:
   python app.py
-
-  # Backtest this season (walk-forward, regular-season games only) and write CSV/JSON
   python app.py --backtest-season
 
 Artifacts:
-  - predictions_today.csv          (today's predictions, raw floats)
-  - predictions_today.html         (pretty HTML with logos, local time, records, season-to-date line)
-  - elo_dump.csv                   (Elo snapshot after history build)
-  - backtest_results.csv           (per-game backtest rows)
-  - backtest_summary.json          (summary metrics)
+  - predictions_today.csv
+  - predictions_today.html
+  - elo_dump.csv
+  - backtest_results.csv
+  - backtest_summary.json
+
+This module is also imported by server.py on Render.
 """
 
 import csv
@@ -25,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, List, Any, Optional
 
-from zoneinfo import ZoneInfo  # Python 3.9+
+from zoneinfo import ZoneInfo
 import numpy as np
 import requests
 from scipy.stats import skellam
@@ -40,8 +39,9 @@ K_BASE = 18.0
 HOME_ADV_ELO = 35.0
 LEAGUE_AVG_GOALS = 6.2
 ELO_TO_XG_SCALE = 0.0035
-RECENCY_TAU_DAYS = 180.0   # larger => slower decay; half-life ~125 days
-LOCAL_TZ = ZoneInfo("America/Chicago")
+RECENCY_TAU_DAYS = 180.0          # recency weighting (half-life ~125 days)
+LOCAL_TZ = ZoneInfo("America/Chicago")  # server/build reference tz (used for daily run/backtest)
+CENTRAL_TZ = ZoneInfo("America/Chicago")  # footer timestamp tz
 
 PREDICTIONS_CSV = "predictions_today.csv"
 PREDICTIONS_HTML = "predictions_today.html"
@@ -54,8 +54,6 @@ API_SCHEDULE_DATE = API_BASE + "/v1/schedule/{date}"   # YYYY-MM-DD
 API_SCORE_DATE    = API_BASE + "/v1/score/{date}"      # YYYY-MM-DD
 API_STANDINGS_NOW = API_BASE + "/v1/standings/now"
 
-CENTRAL_TZ = ZoneInfo("America/Chicago")
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 # =========================
@@ -66,7 +64,7 @@ def session_with_retries():
     retry = Retry(total=5, connect=5, read=5, backoff_factor=0.4,
                   status_forcelist=[429, 500, 502, 503, 504])
     s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.headers.update({"User-Agent": "nhl-predictor/2.4"})
+    s.headers.update({"User-Agent": "nhl-predictor/2.5"})
     return s
 
 SESSION = session_with_retries()
@@ -179,17 +177,13 @@ def _utc_to_local_dt(utc_str: str, tz: ZoneInfo) -> Optional[datetime]:
     except Exception:
         return None
 
-def _utc_to_local_date(utc_str: str, tz: ZoneInfo) -> Optional[datetime.date]:
-    d = _utc_to_local_dt(utc_str, tz)
-    return d.date() if d else None
-
 def fmt_local_time(dt_local: Optional[datetime]) -> str:
     if not dt_local:
         return ""
     try:
-        return dt_local.strftime("%-I:%M %p")  # Unix/mac
+        return dt_local.strftime("%-I:%M %p")  # mac/linux
     except Exception:
-        return dt_local.strftime("%I:%M %p").lstrip("0")  # Windows-safe
+        return dt_local.strftime("%I:%M %p").lstrip("0")  # windows safe
 
 # =========================
 # Odds helpers
@@ -288,6 +282,7 @@ class GameSched:
     away_name: str
     game_type: str
     start_local_dt: Optional[datetime]
+    start_utc_str: str
 
 def get_schedule_for_local_date(local_date: datetime.date) -> List[GameSched]:
     ds = local_date.strftime("%Y-%m-%d")
@@ -297,12 +292,14 @@ def get_schedule_for_local_date(local_date: datetime.date) -> List[GameSched]:
 
     out: List[GameSched] = []
     for g in candidates:
-        start_utc = g.get("startTimeUTC") or g.get("startTimeUTCISO")
+        start_utc = g.get("startTimeUTC") or g.get("startTimeUTCISO") or ""
         start_local_dt = _utc_to_local_dt(start_utc, LOCAL_TZ)
         if not start_local_dt or start_local_dt.date() != local_date:
             continue
         home, away = g.get("homeTeam", {}), g.get("awayTeam", {})
         gt = normalize_game_type(g.get("gameType"))
+        # Strip trailing Z for clean JS "utc + 'Z'" usage later
+        start_utc_clean = start_utc[:-1] if isinstance(start_utc, str) and start_utc.endswith("Z") else (start_utc or "")
         out.append(GameSched(
             game_id=g.get("id") or g.get("gamePk") or g.get("gameId"),
             home_key=canonical_team_key(home),
@@ -310,7 +307,8 @@ def get_schedule_for_local_date(local_date: datetime.date) -> List[GameSched]:
             home_name=full_team_name(home),
             away_name=full_team_name(away),
             game_type=gt,
-            start_local_dt=start_local_dt
+            start_local_dt=start_local_dt,
+            start_utc_str=start_utc_clean
         ))
     logging.info(f"Schedule kept: {len(out)} games on local date {local_date.isoformat()}")
     return out
@@ -329,23 +327,25 @@ def get_finals_for_date(ds: str) -> List[GameFinal]:
     games = (data or {}).get("games") or []
     finals: List[GameFinal] = []
     for g in games:
-        state = (g.get("gameState") or "").upper() if isinstance(g, dict) else ""
+        if not isinstance(g, dict):
+            continue
+        state = (g.get("gameState") or "").upper()
         if state not in {"FINAL", "OFF", "COMPLETE", "COMPLETED", "GAME_OVER"}:
             continue
-        home, away = (g.get("homeTeam", {}) if isinstance(g, dict) else {}), (g.get("awayTeam", {}) if isinstance(g, dict) else {})
-        gt = normalize_game_type(g.get("gameType") if isinstance(g, dict) else None)
+        home, away = g.get("homeTeam", {}), g.get("awayTeam", {})
+        gt = normalize_game_type(g.get("gameType"))
         finals.append(GameFinal(
             date=datetime.strptime(ds, "%Y-%m-%d"),
             home_key=canonical_team_key(home),
             away_key=canonical_team_key(away),
-            home_score=int((home.get("score", 0) if isinstance(home, dict) else 0)),
-            away_score=int((away.get("score", 0) if isinstance(away, dict) else 0)),
+            home_score=int(home.get("score", 0)),
+            away_score=int(away.get("score", 0)),
             game_type=gt
         ))
     return finals
 
 # =========================
-# History build (for daily run or for initial backtest warm-up)
+# History build
 # =========================
 def log_elo_summary(state: dict):
     items = list(state.get("elo", {}).items())
@@ -422,10 +422,7 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
             "home_record": records.get(home_key, ""),
             "away_record": records.get(away_key, ""),
             "local_time": fmt_local_time(g.start_local_dt),
-            "utc_time": (
-                g.start_local_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-                if g.start_local_dt else ""
-            ),
+            "utc_time": g.start_utc_str,  # used by browser to localize display
             "game_type": g.game_type or "",
         })
     return preds
@@ -440,107 +437,53 @@ def write_csv(rows, path):
         w.writeheader()
         w.writerows(rows)
 
-def write_html(preds, out_path, report_date=None, season_line=""):
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    CENTRAL_TZ = ZoneInfo("America/Chicago")
-
+def write_html(preds: List[Dict[str, Any]], path: str, report_date: str, season_line: Optional[str] = None):
+    """
+    Pretty HTML table with logos, retrying multiple logo URLs, % probs (one decimal),
+    local time (browser-local via JS), team records. AWAY metrics first to align with top team.
+    Includes footer with 'Last updated at' in Central Time.
+    """
     updated_time = datetime.now(tz=CENTRAL_TZ).strftime("%a, %b %d, %Y — %I:%M %p %Z")
 
-    html = f"""<!doctype html>
+    # Empty-state page
+    if not preds:
+        html = """
+<!doctype html>
 <html><head><meta charset="utf-8"><title>NHL Predictions %%DATE%%</title>
 <style>
 :root {
-  --bg:#0b1020; --panel:#121933; --panel2:#0e1630;
-  --txt:#e8ecff; --muted:#9fb1ff;
-  --border:#1e2748; --border-strong:#29345e; --accent:#7aa2ff;
+  --bg:#0b1020; --panel:#121933; --panel2:#0e1630; --txt:#e8ecff; --muted:#9fb1ff; --border:#1e2748; --border-strong:#29345e; --accent:#7aa2ff;
 }
 * { box-sizing: border-box; }
-body {
-  font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;
-  background:var(--bg); color:var(--txt); margin:0;
-}
-.wrapper { max-width:1100px; margin:32px auto; padding:0 16px; }
-h1 { font-weight:800; margin:0 0 16px; }
-.seasonline { color:var(--muted); margin:-6px 0 16px; font-weight:600; }
-.card {
-  background:#121933;
-  border:1px solid #1e2748;
-  border-radius:16px;
-  padding:16px;
-  box-shadow:0 10px 30px rgba(0,0,0,.25);
-}
-.empty { opacity:.85; }
-
-/* --- new footer/link styling --- */
-.footer {
-  color: var(--muted);
-  font-size: 12px;
-  margin-top: 16px;
-  text-align: left;
-  opacity: 1;
-}
-.footer a {
-  color: var(--accent);
-  text-decoration: underline;
-  font-weight: 600;
-}
-.footer a:hover,
-.footer a:focus {
-  text-decoration: none;
-  filter: brightness(1.15);
-}
-</style>
-<script>
-// Convert all game times to the viewer's local time
-document.querySelectorAll('.time[data-utc]').forEach(el => {
-  const utc = el.getAttribute('data-utc');
-  if (utc) {
-    const d = new Date(utc + 'Z');
-    el.textContent = d.toLocaleTimeString([], {{ hour: 'numeric', minute: '2-digit' }});
-  }
-});
-</script>
-</head>
-<body><div class="wrapper"><h1>NHL Predictions — %%DATE%%</h1>
-%%SEASONLINE%%
-<div class="card empty">No games found.</div>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;}
+.wrapper{max-width:1100px;margin:32px auto;padding:0 16px;}
+h1{font-weight:800;margin:0 0 16px;}
+.seasonline{color:var(--muted);margin:-6px 0 16px;font-weight:600;}
+.card{background:#121933;border:1px solid #1e2748;border-radius:16px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);}
+.empty{opacity:.85}
+.footer{color:var(--muted);font-size:12px;margin-top:16px;text-align:left;opacity:1;line-height:1.5;}
+.footer a{color:var(--accent);text-decoration:underline;font-weight:600;}
+.footer a:hover,.footer a:focus{text-decoration:none;filter:brightness(1.15);}
+</style></head>
+<body>
+<div class="wrapper">
+  <h1>NHL Predictions — %%DATE%%</h1>
+  %%SEASONLINE%%
+  <div class="card empty">No games found.</div>
+  <div class="footer">
+    <div>Last updated at: <strong>%%UPDATED%%</strong></div>
+    <div>Generated by <a href="https://x.com/reagankingisles">@ReaganKingIsles</a>. Logos © NHL/teams; loaded from NHL CDN.</div>
+  </div>
 </div>
-<script>
-// ---- Daily auto-refresh (viewer local time) ----
-// Refresh every day at 03:10 AM local (give your 3:00 AM CT backend a buffer)
-(function() {
-  function msUntilNext(hour, minute) {
-    const now = new Date();
-    const next = new Date(now);
-    next.setHours(hour, minute, 0, 0);
-    if (next <= now) next.setDate(next.getDate() + 1);
-    return next - now;
-  }
-
-  // 1) Schedule reload at 03:10
-  const delay = msUntilNext(3, 10);
-  setTimeout(function() {
-    // Add a cache-busting param so users don’t see a stale page
-    const url = new URL(location.href);
-    url.searchParams.set('r', Date.now().toString());
-    location.replace(url.toString());
-  }, delay);
-
-  // 2) Safety: hard-refresh if the tab has been open > 24h
-  setTimeout(function() {
-    location.reload();
-  }, 24 * 60 * 60 * 1000);
-})();
-</script>
-
-</body></html>""".replace("%%DATE%%", report_date)
+</body></html>
+""".replace("%%DATE%%", report_date)
         season_html = f'<div class="seasonline">{season_line}</div>' if season_line else ''
-        html = html.replace("%%SEASONLINE%%", season_html)
+        html = html.replace("%%SEASONLINE%%", season_html).replace("%%UPDATED%%", updated_time)
         with open(path, "w", encoding="utf-8") as f:
             f.write(html)
         return
 
+    # Row HTML builder (away-first alignment)
     def row_html(p):
         ph = f"{p['p_home_win'] * 100:.1f}%"
         pa = f"{p['p_away_win'] * 100:.1f}%"
@@ -592,6 +535,7 @@ document.querySelectorAll('.time[data-utc]').forEach(el => {
 
     rows_html = "\n".join(row_html(p) for p in preds)
 
+    # Main HTML page (no f-string; safe for JS/CSS braces)
     html = """
 <!doctype html>
 <html>
@@ -658,18 +602,10 @@ b { color: #fff; }
   margin-top: 16px;
   text-align: left;
   opacity: 1;
+  line-height: 1.5;
 }
-.footer a {
-  color: var(--accent);
-  text-decoration: underline;
-  font-weight: 600;
-}
-.footer a:hover,
-.footer a:focus {
-  text-decoration: none;
-  filter: brightness(1.15);
-}
-
+.footer a { color: var(--accent); text-decoration: underline; font-weight: 600; }
+.footer a:hover, .footer a:focus { text-decoration: none; filter: brightness(1.15); }
 </style>
 </head>
 <body>
@@ -695,12 +631,10 @@ b { color: #fff; }
       <div class="note">xG = expected goals. Modal = most likely integer scoreline from Poisson model.</div>
     </div>
     <div class="footer">
-  <div>Last updated at: <strong>{updated_time}</strong></div>
-  <div>
-    Generated by <a href="https://x.com/reagankingisles">@ReaganKingIsles</a>. 
-    Logos © NHL/teams; loaded from NHL CDN.
+      <div>Last updated at: <strong>%%UPDATED%%</strong></div>
+      <div>Generated by <a href="https://x.com/reagankingisles">@ReaganKingIsles</a>. Logos © NHL/teams; loaded from NHL CDN.</div>
+    </div>
   </div>
-</div>
 <script>
 // Try multiple logo URLs in order. If all fail, hide the image.
 document.querySelectorAll('img.logo').forEach(function(img){
@@ -712,18 +646,50 @@ document.querySelectorAll('img.logo').forEach(function(img){
     else { img.onerror = null; img.style.visibility = 'hidden'; }
   };
 });
+
+// Convert all game times to the viewer's local time
+document.querySelectorAll('.time[data-utc]').forEach(function(el){
+  const utc = el.getAttribute('data-utc');
+  if (utc) {
+    const d = new Date(utc + 'Z');
+    el.textContent = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  }
+});
+
+// ---- Daily auto-refresh (viewer local time) ----
+// Refresh every day at 03:10 AM local (buffer after backend 3:00 AM CT build)
+(function() {
+  function msUntilNext(hour, minute) {
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(hour, minute, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    return next - now;
+  }
+  const delay = msUntilNext(3, 10);
+  setTimeout(function() {
+    const url = new URL(location.href);
+    url.searchParams.set('r', Date.now().toString()); // cache-bust
+    location.replace(url.toString());
+  }, delay);
+  setTimeout(function() { location.reload(); }, 24 * 60 * 60 * 1000); // safety
+})();
 </script>
 </body>
 </html>
 """
     season_html = f'<div class="seasonline">{season_line}</div>' if season_line else ''
-    html = html.replace("%%ROWS%%", rows_html).replace("%%DATE%%", report_date).replace("%%SEASONLINE%%", season_html)
+    html = (html
+            .replace("%%ROWS%%", rows_html)
+            .replace("%%DATE%%", report_date)
+            .replace("%%SEASONLINE%%", season_html)
+            .replace("%%UPDATED%%", updated_time))
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
 
 # =========================
-# Season backtest (walk-forward) + season-to-date record
+# Season backtest + season-to-date record
 # =========================
 def find_season_start(yesterday_local: datetime.date) -> datetime.date:
     start_scan = datetime(yesterday_local.year, 9, 1, tzinfo=LOCAL_TZ).date()
@@ -938,7 +904,7 @@ def compute_season_record_to_date() -> Tuple[int, int, float]:
             hxg, axg = expected_goals(helo, aelo)
             p_home, _ = win_probs_from_skellam(hxg, axg)
 
-            # find final for this matchup
+            # match final
             for gf in finals:
                 if (gf.game_type or "") != "R":
                     continue
@@ -950,7 +916,7 @@ def compute_season_record_to_date() -> Tuple[int, int, float]:
                         correct += 1
                     break
 
-        # update elo with finals of day d
+        # update Elo with finals of the day
         for gf in finals:
             if (gf.game_type or "") != "R":
                 continue
