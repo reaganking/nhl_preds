@@ -501,7 +501,36 @@ document.querySelectorAll('.time[data-utc]').forEach(el => {
 <body><div class="wrapper"><h1>NHL Predictions — %%DATE%%</h1>
 %%SEASONLINE%%
 <div class="card empty">No games found.</div>
-</div></body></html>""".replace("%%DATE%%", report_date)
+</div>
+<script>
+// ---- Daily auto-refresh (viewer local time) ----
+// Refresh every day at 03:10 AM local (give your 3:00 AM CT backend a buffer)
+(function() {
+  function msUntilNext(hour, minute) {
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(hour, minute, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    return next - now;
+  }
+
+  // 1) Schedule reload at 03:10
+  const delay = msUntilNext(3, 10);
+  setTimeout(function() {
+    // Add a cache-busting param so users don’t see a stale page
+    const url = new URL(location.href);
+    url.searchParams.set('r', Date.now().toString());
+    location.replace(url.toString());
+  }, delay);
+
+  // 2) Safety: hard-refresh if the tab has been open > 24h
+  setTimeout(function() {
+    location.reload();
+  }, 24 * 60 * 60 * 1000);
+})();
+</script>
+
+</body></html>""".replace("%%DATE%%", report_date)
         season_html = f'<div class="seasonline">{season_line}</div>' if season_line else ''
         html = html.replace("%%SEASONLINE%%", season_html)
         with open(path, "w", encoding="utf-8") as f:
