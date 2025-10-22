@@ -492,12 +492,12 @@ h1 { font-weight:800; margin:0 0 16px; }
 }
 </style>
 <script>
-// Convert all game times (data-utc attributes) to local time on page load
+// Convert all game times to the viewer's local time
 document.querySelectorAll('.time[data-utc]').forEach(el => {
   const utc = el.getAttribute('data-utc');
   if (utc) {
     const d = new Date(utc + 'Z');
-    el.textContent = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    el.textContent = d.toLocaleTimeString([], {{ hour: 'numeric', minute: '2-digit' }});
   }
 });
 </script>
