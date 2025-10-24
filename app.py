@@ -501,9 +501,9 @@ h1{font-weight:800;margin:0 0 16px}
     <div>Away: <b>{p['ml_away']:+d}</b></div>
     <div>Home: <b>{p['ml_home']:+d}</b></div>
   </td>
-  <td class="xg" data-label="Scoring">
-    <div>xG: <b>{p['pred_xg_away']:.2f}–{p['pred_xg_home']:.2f}</b></div>
-    <div>Modal: <b>{p['pred_mode_away']}-{p['pred_mode_home']}</b></div>
+  <td class="xg" data-label="xG">
+    <div>Away xG: <b>{p['pred_xg_away']:.2f}</b></div>
+    <div>Home xG: <b>{p['pred_xg_home']:.2f}</b></div>
   </td>
 </tr>"""
 
@@ -586,14 +586,14 @@ b{color:#fff}
             <th>Matchup</th>
             <th>Win Prob</th>
             <th>Implied ML</th>
-            <th>Scoring</th>
+            <th>xG</th>
           </tr>
         </thead>
         <tbody>
           %%ROWS%%
         </tbody>
       </table>
-      <div class="note">xG = expected goals. Modal = most likely integer scoreline from Poisson model.</div>
+      <div class="note">xG = expected goals.</div>
     </div>
     <div class="footer">
       <div>Last updated at: <strong>%%UPDATED%%</strong></div>
