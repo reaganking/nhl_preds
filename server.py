@@ -47,10 +47,7 @@ def _generate_predictions_html_for(date_obj):
     # Records + season line
     records = get_team_records()
     correct, total, pct = compute_season_record_to_date()
-    season_line = (
-        f"Season to date: {correct}-{max(total - correct, 0)} ({pct:.1f}%)"
-        if total else "Season to date: —"
-    )
+    season_line = f"Season to date: {correct}-{max(total - correct, 0)} ({pct:.1f}%)" if total else "Season to date: —"
 
     # Predictions
     preds = predict_day(state, date_obj, records)
@@ -82,7 +79,6 @@ def _warm_now():
         _generate_predictions_html_for(today)
         _generate_standings_html_for(today)
     except Exception:
-        # don't crash warm thread
         pass
 
 
