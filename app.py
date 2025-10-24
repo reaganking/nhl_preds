@@ -5,15 +5,6 @@ Daily NHL predictor + season backtester using api-web.nhle.com
 Run locally:
   python app.py
   python app.py --backtest-season
-
-Artifacts:
-  - predictions_today.csv
-  - predictions_today.html
-  - elo_dump.csv
-  - backtest_results.csv
-  - backtest_summary.json
-
-This module is also imported by server.py on Render.
 """
 
 import csv
@@ -39,9 +30,9 @@ K_BASE = 18.0
 HOME_ADV_ELO = 35.0
 LEAGUE_AVG_GOALS = 6.2
 ELO_TO_XG_SCALE = 0.0035
-RECENCY_TAU_DAYS = 180.0          # recency weighting (half-life ~125 days)
-LOCAL_TZ = ZoneInfo("America/Chicago")  # server/build reference tz (used for daily run/backtest)
-CENTRAL_TZ = ZoneInfo("America/Chicago")  # footer timestamp tz
+RECENCY_TAU_DAYS = 180.0
+LOCAL_TZ = ZoneInfo("America/Chicago")
+CENTRAL_TZ = ZoneInfo("America/Chicago")
 
 PREDICTIONS_CSV = "predictions_today.csv"
 PREDICTIONS_HTML = "predictions_today.html"
@@ -64,7 +55,7 @@ def session_with_retries():
     retry = Retry(total=5, connect=5, read=5, backoff_factor=0.4,
                   status_forcelist=[429, 500, 502, 503, 504])
     s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.headers.update({"User-Agent": "nhl-predictor/2.5"})
+    s.headers.update({"User-Agent": "nhl-predictor/3.0"})
     return s
 
 SESSION = session_with_retries()
@@ -131,10 +122,7 @@ def primary_team_logo(team_key: str) -> str:
     return team_logo_candidates(team_key)[0]
 
 def get_team_records() -> Dict[str, str]:
-    """
-    Returns { 'TOR': 'W-L-OT', ... } for current season.
-    Handles several possible shapes the standings endpoint uses.
-    """
+    """Return { 'TOR': 'W-L-OT', ... }."""
     data = safe_get_json(API_STANDINGS_NOW) or {}
     items = data.get("standings") or data.get("records") or data.get("teams") or []
     out: Dict[str, str] = {}
@@ -181,9 +169,9 @@ def fmt_local_time(dt_local: Optional[datetime]) -> str:
     if not dt_local:
         return ""
     try:
-        return dt_local.strftime("%-I:%M %p")  # mac/linux
+        return dt_local.strftime("%-I:%M %p")
     except Exception:
-        return dt_local.strftime("%I:%M %p").lstrip("0")  # windows safe
+        return dt_local.strftime("%I:%M %p").lstrip("0")
 
 # =========================
 # Odds helpers
@@ -298,7 +286,6 @@ def get_schedule_for_local_date(local_date: datetime.date) -> List[GameSched]:
             continue
         home, away = g.get("homeTeam", {}), g.get("awayTeam", {})
         gt = normalize_game_type(g.get("gameType"))
-        # Strip trailing Z for clean JS "utc + 'Z'" usage later
         start_utc_clean = start_utc[:-1] if isinstance(start_utc, str) and start_utc.endswith("Z") else (start_utc or "")
         out.append(GameSched(
             game_id=g.get("id") or g.get("gamePk") or g.get("gameId"),
@@ -405,8 +392,6 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
             "home_key": home_key,
             "away_name": g.away_name,
             "home_name": g.home_name,
-            "home_elo": round(helo, 1),
-            "away_elo": round(aelo, 1),
             "pred_xg_home": round(hxg, 2),
             "pred_xg_away": round(axg, 2),
             "pred_mode_home": mh,
@@ -422,7 +407,7 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
             "home_record": records.get(home_key, ""),
             "away_record": records.get(away_key, ""),
             "local_time": fmt_local_time(g.start_local_dt),
-            "utc_time": g.start_utc_str,  # used by browser to localize display
+            "utc_time": g.start_utc_str,
             "game_type": g.game_type or "",
         })
     return preds
@@ -441,7 +426,7 @@ def write_html(preds: List[Dict[str, Any]], path: str, report_date: str, season_
     """
     Pretty HTML table with logos, retrying multiple logo URLs, % probs (one decimal),
     local time (browser-local via JS), team records. AWAY metrics first to align with top team.
-    Includes footer with 'Last updated at' in Central Time.
+    Elo column removed. Responsive: tablet tweaks + stacked cards on mobile.
     """
     updated_time = datetime.now(tz=CENTRAL_TZ).strftime("%a, %b %d, %Y — %I:%M %p %Z")
 
@@ -451,22 +436,19 @@ def write_html(preds: List[Dict[str, Any]], path: str, report_date: str, season_
 <!doctype html>
 <html><head><meta charset="utf-8"><title>NHL Predictions %%DATE%%</title>
 <style>
-:root {
-  --bg:#0b1020; --panel:#121933; --panel2:#0e1630; --txt:#e8ecff; --muted:#9fb1ff; --border:#1e2748; --border-strong:#29345e; --accent:#7aa2ff;
-}
-* { box-sizing: border-box; }
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;}
-.wrapper{max-width:1100px;margin:32px auto;padding:0 16px;}
-h1{font-weight:800;margin:0 0 16px;}
-.seasonline{color:var(--muted);margin:-6px 0 16px;font-weight:600;}
-.card{background:#121933;border:1px solid #1e2748;border-radius:16px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);}
+:root{--bg:#0b1020;--panel:#121933;--panel2:#0e1630;--txt:#e8ecff;--muted:#9fb1ff;--border:#1e2748;--border-strong:#29345e;--accent:#7aa2ff;}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0}
+.wrapper{max-width:1100px;margin:32px auto;padding:0 16px}
+h1{font-weight:800;margin:0 0 16px}
+.seasonline{color:var(--muted);margin:-6px 0 16px;font-weight:600}
+.card{background:#121933;border:1px solid #1e2748;border-radius:16px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 .empty{opacity:.85}
-.footer{color:var(--muted);font-size:12px;margin-top:16px;text-align:left;opacity:1;line-height:1.5;}
-.footer a{color:var(--accent);text-decoration:underline;font-weight:600;}
-.footer a:hover,.footer a:focus{text-decoration:none;filter:brightness(1.15);}
+.footer{color:var(--muted);font-size:12px;margin-top:16px;text-align:left;opacity:1;line-height:1.5}
+.footer a{color:var(--accent);text-decoration:underline;font-weight:600}
+.footer a:hover,.footer a:focus{text-decoration:none;filter:brightness(1.15)}
 </style></head>
-<body>
-<div class="wrapper">
+<body><div class="wrapper">
   <h1>NHL Predictions — %%DATE%%</h1>
   %%SEASONLINE%%
   <div class="card empty">No games found.</div>
@@ -474,8 +456,7 @@ h1{font-weight:800;margin:0 0 16px;}
     <div>Last updated at: <strong>%%UPDATED%%</strong></div>
     <div>Generated by <a href="https://x.com/reagankingisles">@ReaganKingIsles</a>. Logos © NHL/teams; loaded from NHL CDN.</div>
   </div>
-</div>
-</body></html>
+</div></body></html>
 """.replace("%%DATE%%", report_date)
         season_html = f'<div class="seasonline">{season_line}</div>' if season_line else ''
         html = html.replace("%%SEASONLINE%%", season_html).replace("%%UPDATED%%", updated_time)
@@ -483,7 +464,7 @@ h1{font-weight:800;margin:0 0 16px;}
             f.write(html)
         return
 
-    # Row HTML builder (away-first alignment)
+    # Row HTML builder (away-first alignment) — Elo removed from output
     def row_html(p):
         ph = f"{p['p_home_win'] * 100:.1f}%"
         pa = f"{p['p_away_win'] * 100:.1f}%"
@@ -502,9 +483,7 @@ h1{font-weight:800;margin:0 0 16px;}
         <div class="name">{away_name}</div>
       </div>
     </div>
-    <div class="vs">
-      at <span class="time" data-utc="{p.get('utc_time','')}">{time_str}</span>
-    </div>
+    <div class="vs">at <span class="time" data-utc="{p.get('utc_time','')}">{time_str}</span></div>
     <div class="team home">
       <img class="logo" src="{p['home_logo']}" data-alts='{alts_home}' alt="{p['home_key']}" loading="lazy"/>
       <div class="meta">
@@ -514,22 +493,17 @@ h1{font-weight:800;margin:0 0 16px;}
     </div>
   </td>
 
-  <!-- AWAY FIRST, THEN HOME -->
-  <td class="prob">
+  <td class="prob" data-label="Win Prob">
     <div>Away: <b>{pa}</b></div>
     <div>Home: <b>{ph}</b></div>
   </td>
-  <td class="ml">
+  <td class="ml" data-label="Implied ML">
     <div>Away: <b>{p['ml_away']:+d}</b></div>
     <div>Home: <b>{p['ml_home']:+d}</b></div>
   </td>
-  <td class="xg">
+  <td class="xg" data-label="Scoring">
     <div>xG: <b>{p['pred_xg_away']:.2f}–{p['pred_xg_home']:.2f}</b></div>
     <div>Modal: <b>{p['pred_mode_away']}-{p['pred_mode_home']}</b></div>
-  </td>
-  <td class="elo">
-    <div>Away Elo: <b>{p['away_elo']:.1f}</b></div>
-    <div>Home Elo: <b>{p['home_elo']:.1f}</b></div>
   </td>
 </tr>"""
 
@@ -544,68 +518,60 @@ h1{font-weight:800;margin:0 0 16px;}
 <title>NHL Predictions %%DATE%%</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-:root {
-  --bg:#0b1020;
-  --panel:#121933;
-  --panel2:#0e1630;
-  --txt:#e8ecff;
-  --muted:#9fb1ff;
-  --border:#1e2748;
-  --border-strong:#29345e;
-  --accent:#7aa2ff;
+:root{--bg:#0b1020;--panel:#121933;--panel2:#0e1630;--txt:#e8ecff;--muted:#9fb1ff;--border:#1e2748;--border-strong:#29345e;--accent:#7aa2ff;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif}
+.wrapper{max-width:1150px;margin:28px auto;padding:0 16px}
+h1{margin:0 0 18px;font-weight:800;letter-spacing:.3px}
+.seasonline{color:var(--muted);margin:-6px 0 16px;font-weight:600}
+.subtitle{color:var(--muted);margin-bottom:18px}
+.table-card{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:16px;padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+table{width:100%;border-collapse:separate;border-spacing:0 8px}
+thead th{text-align:left;font-weight:700;color:var(--muted);font-size:14px;padding:10px;border-bottom:1px solid var(--border)}
+tbody tr{background:rgba(255,255,255,.02);border:2px solid var(--border-strong);border-radius:10px;transition:background .2s,border-color .2s}
+tbody tr:hover{background:rgba(255,255,255,.05);border-color:var(--accent)}
+tbody td{padding:12px 10px;vertical-align:middle}
+.teams{min-width:420px}
+.team{display:flex;align-items:center;gap:10px}
+.team img.logo{width:34px;height:34px;object-fit:contain;filter:drop-shadow(0 1px 2px rgba(0,0,0,.4))}
+.team .meta .abbr{font-weight:700}
+.team .meta .name{font-size:12px;color:var(--muted)}
+.vs{margin:8px 6px;color:var(--muted);font-size:12px}
+.vs .time{font-weight:700;color:#fff;margin-left:6px}
+.prob,.ml,.xg{white-space:nowrap}
+b{color:#fff}
+.note{margin-top:10px;color:var(--muted);font-size:12px}
+.footer{color:var(--muted);font-size:12px;margin-top:16px;text-align:left;opacity:1;line-height:1.5}
+.footer a{color:var(--accent);text-decoration:underline;font-weight:600}
+.footer a:hover,.footer a:focus{text-decoration:none;filter:brightness(1.15)}
+
+/* === Responsive tweaks === */
+@media (max-width:900px){
+  .wrapper{max-width:960px}
+  thead th{font-size:13px}
+  tbody td{padding:10px 8px}
+  .team img.logo{width:30px;height:30px}
 }
-* { box-sizing: border-box; }
-body {
-  margin:0;
-  background:var(--bg);
-  color:var(--txt);
-  font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Helvetica, Arial, sans-serif;
+
+@media (max-width:640px){
+  .wrapper{max-width:100%;padding:0 12px}
+  .table-card{padding:10px}
+  table,thead,tbody,th,td,tr{display:block}
+  thead{position:absolute;left:-9999px;top:-9999px}
+  tbody tr{border-radius:12px;margin:10px 0;padding:6px 6px 10px}
+  td.teams{padding:10px 8px 8px;border-bottom:1px solid var(--border);min-width:0}
+  .team{gap:8px}
+  .team img.logo{width:28px;height:28px}
+  .team .meta .name{font-size:11px}
+  .vs{margin:6px 0 4px;font-size:11px}
+  td.prob,td.ml,td.xg{
+    display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 8px;white-space:normal
+  }
+  td.prob::before,td.ml::before,td.xg::before{
+    content:attr(data-label);color:var(--muted);font-weight:700;letter-spacing:.2px
+  }
+  td.prob b,td.ml b,td.xg b{font-weight:800}
 }
-.wrapper { max-width: 1150px; margin: 28px auto; padding: 0 16px; }
-h1 { margin: 0 0 18px; font-weight: 800; letter-spacing:.3px; }
-.seasonline { color: var(--muted); margin: -6px 0 16px; font-weight: 600; }
-.subtitle { color: var(--muted); margin-bottom: 18px; }
-.table-card {
-  background: linear-gradient(145deg, var(--panel), var(--panel2));
-  border: 1px solid var(--border);
-  border-radius: 16px; padding: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.25);
-}
-table { width: 100%; border-collapse: separate; border-spacing: 0 8px; }
-thead th {
-  text-align: left; font-weight: 700; color: var(--muted); font-size: 14px; padding: 10px;
-  border-bottom: 1px solid var(--border);
-}
-tbody tr {
-  background: rgba(255,255,255,0.02);
-  border: 2px solid var(--border-strong);
-  border-radius: 10px;
-  transition: background 0.2s, border-color 0.2s;
-}
-tbody tr:hover {
-  background: rgba(255,255,255,0.05);
-  border-color: var(--accent);
-}
-tbody td { padding: 12px 10px; vertical-align: middle; }
-.teams { min-width: 420px; }
-.team { display:flex; align-items:center; gap:10px; }
-.team img.logo { width:34px; height:34px; object-fit:contain; filter: drop-shadow(0 1px 2px rgba(0,0,0,.4)); }
-.team .meta .abbr { font-weight:700; }
-.team .meta .name { font-size: 12px; color: var(--muted); }
-.vs { margin:8px 6px; color: var(--muted); font-size:12px; }
-.vs .time { font-weight:700; color:#fff; margin-left:6px; }
-.prob, .ml, .xg, .elo { white-space: nowrap; }
-b { color: #fff; }
-.note { margin-top:10px; color: var(--muted); font-size:12px; }
-.footer {
-  color: var(--muted);
-  font-size: 12px;
-  margin-top: 16px;
-  text-align: left;
-  opacity: 1;
-  line-height: 1.5;
-}
-.footer a { color: var(--accent); text-decoration: underline; font-weight: 600; }
-.footer a:hover, .footer a:focus { text-decoration: none; filter: brightness(1.15); }
 </style>
 </head>
 <body>
@@ -621,7 +587,6 @@ b { color: #fff; }
             <th>Win Prob</th>
             <th>Implied ML</th>
             <th>Scoring</th>
-            <th>Elo</th>
           </tr>
         </thead>
         <tbody>
@@ -656,27 +621,22 @@ document.querySelectorAll('.time[data-utc]').forEach(function(el){
   }
 });
 
-// ---- Daily auto-refresh (viewer local time) ----
-// Refresh every day at 03:10 AM local (buffer after backend 3:00 AM CT build)
-(function() {
-  function msUntilNext(hour, minute) {
+// Daily auto-refresh at 03:10 local
+(function(){
+  function msUntilNext(h, m){
     const now = new Date();
-    const next = new Date(now);
-    next.setHours(hour, minute, 0, 0);
+    const next = new Date(now); next.setHours(h, m, 0, 0);
     if (next <= now) next.setDate(next.getDate() + 1);
     return next - now;
   }
-  const delay = msUntilNext(3, 10);
-  setTimeout(function() {
-    const url = new URL(location.href);
-    url.searchParams.set('r', Date.now().toString()); // cache-bust
-    location.replace(url.toString());
-  }, delay);
-  setTimeout(function() { location.reload(); }, 24 * 60 * 60 * 1000); // safety
+  setTimeout(function(){
+    const u = new URL(location.href); u.searchParams.set('r', Date.now().toString());
+    location.replace(u.toString());
+  }, msUntilNext(3, 10));
+  setTimeout(function(){ location.reload(); }, 24*60*60*1000);
 })();
 </script>
-</body>
-</html>
+</body></html>
 """
     season_html = f'<div class="seasonline">{season_line}</div>' if season_line else ''
     html = (html
@@ -689,7 +649,7 @@ document.querySelectorAll('.time[data-utc]').forEach(function(el){
         f.write(html)
 
 # =========================
-# Season backtest + season-to-date record
+# Backtest + season-to-date
 # =========================
 def find_season_start(yesterday_local: datetime.date) -> datetime.date:
     start_scan = datetime(yesterday_local.year, 9, 1, tzinfo=LOCAL_TZ).date()
@@ -698,14 +658,7 @@ def find_season_start(yesterday_local: datetime.date) -> datetime.date:
         ds = d.strftime("%Y-%m-%d")
         data = safe_get_json(API_SCORE_DATE.format(date=ds))
         games = (data or {}).get("games") or []
-        has_regular = False
-        for g in games:
-            if not isinstance(g, dict):
-                continue
-            gt = normalize_game_type(g.get("gameType"))
-            if gt == "R":
-                has_regular = True
-                break
+        has_regular = any(normalize_game_type((g or {}).get("gameType")) == "R" for g in games if isinstance(g, dict))
         if has_regular:
             return d
         d += timedelta(days=1)
@@ -726,8 +679,7 @@ def backtest_this_season():
     rows = []
     d = season_start
     while d <= yesterday:
-        sched = get_schedule_for_local_date(d)
-        sched = [g for g in sched if (g.game_type or "R") == "R"]  # regular only
+        sched = [g for g in get_schedule_for_local_date(d) if (g.game_type or "R") == "R"]
         for g in sched:
             helo = state.get("elo", {}).get(g.home_key, ELO_INIT)
             aelo = state.get("elo", {}).get(g.away_key, ELO_INIT)
@@ -754,8 +706,7 @@ def backtest_this_season():
                 continue
             if gf.home_key == "UNKNOWN" or gf.away_key == "UNKNOWN":
                 continue
-            update_elo(state, gf.home_key, gf.away_key,
-                       gf.home_score, gf.away_score,
+            update_elo(state, gf.home_key, gf.away_key, gf.home_score, gf.away_score,
                        gf.date, datetime(d.year, d.month, d.day, tzinfo=LOCAL_TZ))
         d += timedelta(days=1)
 
@@ -766,23 +717,14 @@ def backtest_this_season():
             if (gf.game_type or "") != "R":
                 continue
             k = (d.isoformat(), gf.home_key, gf.away_key)
-            actuals[k] = {
-                "home_score": gf.home_score,
-                "away_score": gf.away_score,
-                "home_win": 1 if gf.home_score > gf.away_score else 0
-            }
+            actuals[k] = {"home_score": gf.home_score, "away_score": gf.away_score, "home_win": 1 if gf.home_score > gf.away_score else 0}
         d += timedelta(days=1)
 
     results = []
-    brier_sum = 0.0
-    logloss_sum = 0.0
+    brier_sum = logloss_sum = 0.0
     acc_sum = 0
-    mae_home_sum = 0.0
-    mae_away_sum = 0.0
-    mae_total_sum = 0.0
-    rmse_home_sq_sum = 0.0
-    rmse_away_sq_sum = 0.0
-    rmse_total_sq_sum = 0.0
+    mae_home_sum = mae_away_sum = mae_total_sum = 0.0
+    rmse_home_sq_sum = rmse_away_sq_sum = rmse_total_sq_sum = 0.0
     n = 0
 
     for r in rows:
@@ -803,31 +745,17 @@ def backtest_this_season():
         err_away = pred_away - act_away
         err_total = (pred_home + pred_away) - (act_home + act_away)
 
-        mae_home_sum += abs(err_home)
-        mae_away_sum += abs(err_away)
-        mae_total_sum += abs(err_total)
-
-        rmse_home_sq_sum += err_home ** 2
-        rmse_away_sq_sum += err_away ** 2
-        rmse_total_sq_sum += err_total ** 2
+        mae_home_sum += abs(err_home); mae_away_sum += abs(err_away); mae_total_sum += abs(err_total)
+        rmse_home_sq_sum += err_home**2; rmse_away_sq_sum += err_away**2; rmse_total_sq_sum += err_total**2
 
         results.append({
             **r,
-            "home_score": act_home,
-            "away_score": act_away,
-            "home_win": home_win,
-            "picked_correct": acc,
-            "brier": brier,
-            "logloss": logloss,
-            "abs_err_home_goals": abs(err_home),
-            "abs_err_away_goals": abs(err_away),
-            "abs_err_total_goals": abs(err_total),
+            "home_score": act_home, "away_score": act_away, "home_win": home_win,
+            "picked_correct": acc, "brier": brier, "logloss": logloss,
+            "abs_err_home_goals": abs(err_home), "abs_err_away_goals": abs(err_away), "abs_err_total_goals": abs(err_total),
         })
 
-        brier_sum += brier
-        logloss_sum += logloss
-        acc_sum += acc
-        n += 1
+        brier_sum += brier; logloss_sum += logloss; acc_sum += acc; n += 1
 
     if n == 0:
         logging.warning("Backtest found no regular-season games to evaluate.")
@@ -836,49 +764,25 @@ def backtest_this_season():
             json.dump({"games_evaluated": 0}, f, indent=2)
         return
 
-    brier = brier_sum / n
-    logloss = logloss_sum / n
-    accuracy = acc_sum / n
-    mae_home = mae_home_sum / n
-    mae_away = mae_away_sum / n
-    mae_total = mae_total_sum / n
-    rmse_home = math.sqrt(rmse_home_sq_sum / n)
-    rmse_away = math.sqrt(rmse_away_sq_sum / n)
-    rmse_total = math.sqrt(rmse_total_sq_sum / n)
+    brier = brier_sum / n; logloss = logloss_sum / n; accuracy = acc_sum / n
+    mae_home = mae_home_sum / n; mae_away = mae_away_sum / n; mae_total = mae_total_sum / n
+    rmse_home = math.sqrt(rmse_home_sq_sum / n); rmse_away = math.sqrt(rmse_away_sq_sum / n); rmse_total = math.sqrt(rmse_total_sq_sum / n)
 
     for row in results:
-        for k in ("pred_p_home", "pred_p_away", "pred_xg_home", "pred_xg_away",
-                  "brier", "logloss", "abs_err_home_goals", "abs_err_away_goals", "abs_err_total_goals"):
+        for k in ("pred_p_home", "pred_p_away", "pred_xg_home", "pred_xg_away", "brier", "logloss",
+                  "abs_err_home_goals", "abs_err_away_goals", "abs_err_total_goals"):
             row[k] = round(row[k], 4)
     write_csv(results, BACKTEST_CSV)
     summary = {
-        "games_evaluated": n,
-        "accuracy": round(accuracy, 4),
-        "brier": round(brier, 5),
-        "logloss": round(logloss, 5),
-        "mae_home_goals": round(mae_home, 4),
-        "mae_away_goals": round(mae_away, 4),
-        "mae_total_goals": round(mae_total, 4),
-        "rmse_home_goals": round(rmse_home, 4),
-        "rmse_away_goals": round(rmse_away, 4),
-        "rmse_total_goals": round(rmse_total, 4),
+        "games_evaluated": n, "accuracy": round(accuracy, 4), "brier": round(brier, 5), "logloss": round(logloss, 5),
+        "mae_home_goals": round(mae_home, 4), "mae_away_goals": round(mae_away, 4), "mae_total_goals": round(mae_total, 4),
+        "rmse_home_goals": round(rmse_home, 4), "rmse_away_goals": round(rmse_away, 4), "rmse_total_goals": round(rmse_total, 4),
     }
     with open(BACKTEST_SUMMARY_JSON, "w") as f:
         json.dump(summary, f, indent=2)
-
-    logging.info(
-        f"Backtest complete on {n} games. "
-        f"Acc={summary['accuracy']}, Brier={summary['brier']}, LogLoss={summary['logloss']} | "
-        f"MAE (H,A,T)=({summary['mae_home_goals']},{summary['mae_away_goals']},{summary['mae_total_goals']}) | "
-        f"RMSE (H,A,T)=({summary['rmse_home_goals']},{summary['rmse_away_goals']},{summary['rmse_total_goals']})"
-    )
-    print(f"\nBacktest summary -> {BACKTEST_SUMMARY_JSON}\nBacktest rows -> {BACKTEST_CSV}")
+    logging.info(f"Backtest complete on {n} games. Acc={summary['accuracy']}, Brier={summary['brier']}, LogLoss={summary['logloss']}")
 
 def compute_season_record_to_date() -> Tuple[int, int, float]:
-    """
-    Walk-forward from this season's first regular-season day through yesterday.
-    Returns (correct, total, pct).
-    """
     today_local = datetime.now(tz=LOCAL_TZ).date()
     yesterday = today_local - timedelta(days=1)
     if yesterday < datetime(today_local.year, 9, 1, tzinfo=LOCAL_TZ).date():
@@ -890,21 +794,16 @@ def compute_season_record_to_date() -> Tuple[int, int, float]:
     if warm_start <= (season_start - timedelta(days=1)):
         build_elo_from_history(state, warm_start, season_start - timedelta(days=1), include_types=("R","P"))
 
-    correct = 0
-    total = 0
+    correct = total = 0
     d = season_start
     while d <= yesterday:
-        sched = get_schedule_for_local_date(d)
-        sched = [g for g in sched if (g.game_type or "R") == "R"]
+        sched = [g for g in get_schedule_for_local_date(d) if (g.game_type or "R") == "R"]
         finals = get_finals_for_date(d.strftime("%Y-%m-%d"))
-
         for g in sched:
             helo = state.get("elo", {}).get(g.home_key, ELO_INIT)
             aelo = state.get("elo", {}).get(g.away_key, ELO_INIT)
             hxg, axg = expected_goals(helo, aelo)
             p_home, _ = win_probs_from_skellam(hxg, axg)
-
-            # match final
             for gf in finals:
                 if (gf.game_type or "") != "R":
                     continue
@@ -915,15 +814,12 @@ def compute_season_record_to_date() -> Tuple[int, int, float]:
                     if model_pick_home == home_win:
                         correct += 1
                     break
-
-        # update Elo with finals of the day
         for gf in finals:
             if (gf.game_type or "") != "R":
                 continue
             if gf.home_key == "UNKNOWN" or gf.away_key == "UNKNOWN":
                 continue
-            update_elo(state, gf.home_key, gf.away_key,
-                       gf.home_score, gf.away_score,
+            update_elo(state, gf.home_key, gf.away_key, gf.home_score, gf.away_score,
                        gf.date, datetime(d.year, d.month, d.day, tzinfo=LOCAL_TZ))
         d += timedelta(days=1)
 
@@ -946,18 +842,14 @@ def main():
         backtest_this_season()
         return
 
-    # Daily prediction (today)
+    # Daily prediction
     today_local = datetime.now(tz=LOCAL_TZ).date()
     start_date = datetime(today_local.year - 1, 10, 1, tzinfo=LOCAL_TZ).date()
     end_date = today_local - timedelta(days=1)
-
     state = {"elo": {}}
     build_elo_from_history(state, start_date, end_date, include_types=("R","P"))
 
-    # Pull current records for HTML
     records = get_team_records()
-
-    # Season record through yesterday
     correct, total, pct = compute_season_record_to_date()
     season_line = f"Season to date: {correct}-{max(total - correct, 0)} ({pct:.1f}%)" if total else "Season to date: —"
 
@@ -968,11 +860,10 @@ def main():
     print(f"Predictions for {today_local.isoformat()}:")
     if preds:
         for p in preds:
-            print(f"{p['away_key']} ({p['away_name']}) @ {p['home_key']} ({p['home_name']}), "
-                  f"{p['local_time']}: "
-                  f"P(home)={p['p_home_win']:.3f}, P(away)={p['p_away_win']:.3f} | "
-                  f"ML(home)={p['ml_home']:+d}, ML(away)={p['ml_away']:+d} | "
-                  f"xG ≈ {p['pred_xg_away']:.2f}-{p['pred_xg_home']:.2f} (away-home) | "
+            print(f"{p['away_key']} @ {p['home_key']} {p['local_time']}: "
+                  f"P(H)={p['p_home_win']:.3f}, P(A)={p['p_away_win']:.3f}, "
+                  f"ML(H)={p['ml_home']:+d}, ML(A)={p['ml_away']:+d}, "
+                  f"xG {p['pred_xg_away']:.2f}-{p['pred_xg_home']:.2f}, "
                   f"Modal {p['pred_mode_away']}-{p['pred_mode_home']}")
     else:
         print("(no games found)")
