@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Daily NHL predictor + season backtester using api-web.nhle.com
-Also renders a Standings page.
+Also renders a Standings page (Conference -> Division), with advanced metrics.
 
 Run locally:
-  python app.py               # builds today's predictions HTML locally
-  python app.py --backtest-season  # produce backtest CSV + summary
+  python app.py
+  python app.py --backtest-season
 """
 
 import csv
@@ -142,12 +142,9 @@ def get_team_records() -> Dict[str, str]:
             w = it.get("wins") if isinstance(it.get("wins"), int) else (it.get("record", {}) or {}).get("wins") or it.get("w") or 0
             l = it.get("losses") if isinstance(it.get("losses"), int) else (it.get("record", {}) or {}).get("losses") or it.get("l") or 0
             ot = (it.get("otLosses") if isinstance(it.get("otLosses"), int) else None)
-            if ot is None:
-                ot = (it.get("overtimeLosses") if isinstance(it.get("overtimeLosses"), int) else None)
-            if ot is None:
-                ot = (it.get("otl") if isinstance(it.get("otl"), int) else None)
-            if ot is None:
-                ot = (it.get("record", {}) or {}).get("ot") or (it.get("record", {}) or {}).get("overtimeLosses") or 0
+            if ot is None: ot = (it.get("overtimeLosses") if isinstance(it.get("overtimeLosses"), int) else None)
+            if ot is None: ot = (it.get("otl") if isinstance(it.get("otl"), int) else None)
+            if ot is None: ot = (it.get("record", {}) or {}).get("ot") or (it.get("record", {}) or {}).get("overtimeLosses") or 0
             out[abbr] = f"{int(w)}-{int(l)}-{int(ot)}"
         except Exception:
             continue
@@ -410,17 +407,11 @@ def write_csv(rows, path):
         w.writerows(rows)
 
 # =========================
-# HTML: Predictions (no modal; responsive)
+# HTML: Predictions (xG only; responsive; nav)
 # =========================
 def write_html(preds: List[Dict[str, Any]], path: str, report_date: str, season_line: Optional[str] = None):
-    """
-    Pretty HTML table with logos, retrying multiple logo URLs, % probs (one decimal),
-    local time (browser-local via JS), team records. AWAY metrics first to align with top team.
-    'Modal' removed; show only xG away/home. Includes nav to Standings. Responsive layout.
-    """
     updated_time = datetime.now(tz=CENTRAL_TZ).strftime("%a, %b %d, %Y — %I:%M %p %Z")
 
-    # Empty-state page
     if not preds:
         html = """
 <!doctype html>
@@ -463,7 +454,6 @@ h1{font-weight:800;margin:0 0 16px;letter-spacing:.3px}
             f.write(html)
         return
 
-    # Row HTML builder (away-first alignment) — no modal, xG only
     def row_html(p):
         ph = f"{p['p_home_win'] * 100:.1f}%"
         pa = f"{p['p_away_win'] * 100:.1f}%"
@@ -508,7 +498,6 @@ h1{font-weight:800;margin:0 0 16px;letter-spacing:.3px}
 
     rows_html = "\n".join(row_html(p) for p in preds)
 
-    # Main HTML page
     html = """
 <!doctype html>
 <html>
@@ -546,15 +535,12 @@ b{color:#fff}
 .footer{color:var(--muted);font-size:12px;margin-top:16px;text-align:left;opacity:1;line-height:1.5}
 .footer a{color:var(--accent);text-decoration:underline;font-weight:600}
 .footer a:hover,.footer a:focus{text-decoration:none;filter:brightness(1.15)}
-
-/* === Responsive tweaks === */
 @media (max-width:900px){
   .wrapper{max-width:960px}
   thead th{font-size:13px}
   tbody td{padding:10px 8px}
   .team img.logo{width:30px;height:30px}
 }
-
 @media (max-width:640px){
   .wrapper{max-width:100%;padding:0 12px}
   .table-card{padding:10px}
@@ -607,18 +593,16 @@ b{color:#fff}
     </div>
   </div>
 <script>
-// Try multiple logo URLs; if all fail, hide the image.
+// Logo fallbacks
 document.querySelectorAll('img.logo').forEach(function(img){
-  let alts = [];
-  try { alts = JSON.parse(img.dataset.alts || '[]'); } catch(e) { alts = []; }
+  let alts = []; try { alts = JSON.parse(img.dataset.alts || '[]'); } catch(e) {}
   let i = 0;
   img.onerror = function(){
     if (i < alts.length) { img.src = alts[i++]; }
     else { img.onerror = null; img.style.visibility = 'hidden'; }
   };
 });
-
-// Convert all game times to the viewer's local time
+// Localize game times
 document.querySelectorAll('.time[data-utc]').forEach(function(el){
   const utc = el.getAttribute('data-utc');
   if (utc) {
@@ -626,8 +610,7 @@ document.querySelectorAll('.time[data-utc]').forEach(function(el){
     el.textContent = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   }
 });
-
-// Daily auto-refresh at 03:10 local (viewer)
+// Gentle auto-refresh daily at 03:10 local (viewer)
 (function(){
   function msUntilNext(h, m){
     const now = new Date();
@@ -650,48 +633,25 @@ document.querySelectorAll('.time[data-utc]').forEach(function(el){
             .replace("%%DATE%%", report_date)
             .replace("%%SEASONLINE%%", season_html)
             .replace("%%UPDATED%%", updated_time))
-
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
 
 # =========================
-# Standings: data + HTML (sortable, with divisions and advanced metrics)
+# Standings: data (advanced metrics + conference/division) + HTML
 # =========================
-def _get_num(it: dict, *keys, default=0):
-    """Safely get a numeric value from several alternative keys."""
-    for k in keys:
-        v = it.get(k)
-        if v is None and isinstance(it.get("record"), dict):
-            v = it["record"].get(k)
-        if v is None and isinstance(it.get("team"), dict):
-            v = it["team"].get(k)
-        if v is not None:
-            try:
-                return float(v)
-            except Exception:
-                try:
-                    return float(str(v).replace("%",""))
-                except Exception:
-                    pass
-    return float(default)
-
-def _get_str(it: dict, *keys, default=""):
-    for k in keys:
-        v = it.get(k)
-        if isinstance(v, str) and v:
-            return v
-        if isinstance(v, dict):
-            dv = v.get("default")
-            if isinstance(dv, str) and dv:
-                return dv
-    return default
-
 def fetch_standings_now() -> List[dict]:
-    """Return list of team rows with advanced metrics + division info."""
+    """Return rows with base + advanced stats + conference & division."""
     data = safe_get_json(API_STANDINGS_NOW) or {}
     items = data.get("standings") or data.get("records") or data.get("teams") or []
     rows: List[dict] = []
-    EXP = 2.19
+
+    def gi(d, *keys, default=0):
+        for k in keys:
+            v = d.get(k)
+            if isinstance(v, (int, float)):
+                return v
+        return default
+
     for it in items:
         try:
             abbr = (
@@ -704,95 +664,96 @@ def fetch_standings_now() -> List[dict]:
             if not abbr:
                 continue
 
-            w  = int(_get_num(it, "wins", "w", default=0))
-            l  = int(_get_num(it, "losses", "l", default=0))
-            ot = int(_get_num(it, "otLosses", "overtimeLosses", "otl", "ot", default=0))
-            gp = int(_get_num(it, "gamesPlayed", default=w+l+ot))
-            pts = int(_get_num(it, "points", default=2*w + ot))
+            # Basic
+            w  = int(gi(it, "wins", "w"))
+            l  = int(gi(it, "losses", "l"))
+            ot = int(gi(it, "otLosses", "overtimeLosses", "otl", default=0))
+            gp = int(gi(it, "gamesPlayed", default=(w + l + ot)))
+            pts = int(gi(it, "points", default=(2*w + ot)))
 
-            gf  = int(_get_num(it, "goalsFor", "goalFor", default=0))
-            ga  = int(_get_num(it, "goalsAgainst", "goalAgainst", default=0))
-            l10gf = float(_get_num(it, "l10GoalsFor", default=0))
-            l10ga = float(_get_num(it, "l10GoalsAgainst", default=0))
+            gf = int(gi(it, "goalsFor", "goalFor", default=0))
+            ga = int(gi(it, "goalsAgainst", "goalAgainst", default=0))
 
-            # Win pct: prefer API; fallback to computed
-            win_pct = _get_num(it, "winPctg", default=(w/gp if gp else 0.0))
-            pt_pct = (pts / (2*gp)) if gp else 0.0
+            l10_gf = float(gi(it, "l10GoalsFor", default=0.0))
+            l10_ga = float(gi(it, "l10GoalsAgainst", default=0.0))
 
-            # Pythagorean expectation
-            if gf > 0 or ga > 0:
-                gf_exp = gf ** EXP
-                ga_exp = ga ** EXP
-                pythag = gf_exp / (gf_exp + ga_exp) if (gf_exp + ga_exp) > 0 else 0.0
-            else:
-                pythag = 0.0
-
-            xP = (gp * 2) * pythag
-            xW = gp * pythag
-            xvrP = pts - xP
-            xvrW = w - xW
-            pace = int(round(pt_pct * 164))
-            xTP  = int(round(pythag * 164))
-
-            if l10gf > 0 or l10ga > 0:
-                l10gf_exp = l10gf ** EXP
-                l10ga_exp = l10ga ** EXP
-                l10_pyth = l10gf_exp / (l10gf_exp + l10ga_exp) if (l10gf_exp + l10ga_exp) > 0 else 0.0
-            else:
-                l10_pyth = 0.0
-
-            division = (
-                _get_str(it, "divisionName")
-                or _get_str(it.get("division", {}) or {}, "name")
-                or _get_str((it.get("team", {}) or {}).get("division", {}) or {}, "name")
-                or "Unknown"
-            )
+            # Conference & Division
             conference = (
-                _get_str(it, "conferenceName")
-                or _get_str(it.get("conference", {}) or {}, "name")
-                or _get_str((it.get("team", {}) or {}).get("conference", {}) or {}, "name")
-                or "Unknown"
+                it.get("conferenceName")
+                or (it.get("conference") or {}).get("name")
+                or (it.get("conference", {}) or {}).get("default")
+                or "Unknown Conference"
+            )
+            division = (
+                it.get("divisionName")
+                or (it.get("division") or {}).get("name")
+                or (it.get("division", {}) or {}).get("default")
+                or "Unknown Division"
             )
 
-            row = {
-                "abbr": abbr,
-                "name": (_get_str(it, "teamName") or _get_str(it.get("team", {}) or {}, "name") or abbr),
-                "logo": primary_team_logo(abbr),
-                "logo_alts": json.dumps(team_logo_candidates(abbr)),
+            # Name + logos
+            display_name = (
+                ((it.get("teamName") or {}) or {}).get("default")
+                or ((it.get("team", {}) or {}).get("name"))
+                or abbr
+            )
+            logo = primary_team_logo(abbr)
+            logo_alts = json.dumps(team_logo_candidates(abbr))
+
+            # Advanced metrics
+            point_percentage = round(pts / (gp * 2), 3) if gp else 0.0
+            win_pctg_raw = it.get("winPctg")
+            win_percentage = round(float(win_pctg_raw), 3) if isinstance(win_pctg_raw, (int, float)) else (
+                round(w / gp, 3) if gp else 0.0
+            )
+            exp = 2.19
+            num = (gf ** exp) if gf > 0 else 0.0
+            den = ((gf ** exp) + (ga ** exp)) if (gf + ga) > 0 else 1.0
+            pythag = round(num / den, 3)
+            xP = round((gp * 2) * pythag, 2)
+            xW = round(gp * pythag, 2)
+            xvrP = round(pts - xP, 2)
+            xvrW = round(w - xW, 2)
+            pace = int(point_percentage * 164)
+            xTP = int(pythag * 164)
+            if (l10_gf + l10_ga) > 0:
+                l10pythag = round((l10_gf ** exp) / ((l10_gf ** exp) + (l10_ga ** exp)), 3)
+            else:
+                l10pythag = 0.0
+
+            rows.append({
+                "abbr": abbr, "name": display_name, "logo": logo, "logo_alts": logo_alts,
+                "conference": conference, "division": division,
                 "gp": gp, "w": w, "l": l, "ot": ot, "pts": pts,
                 "gf": gf, "ga": ga, "diff": gf - ga,
-                "ptspct": round(pt_pct, 3), "winpct": round(win_pct, 3),
-                "pyth": round(pythag, 3),
-                "xP": round(xP, 2), "xW": round(xW, 2),
-                "xvrP": round(xvrP, 2), "xvrW": round(xvrW, 2),
-                "pace": int(pace), "xTP": int(xTP),
-                "l10pyth": round(l10_pyth, 3),
-                "division": division, "conference": conference,
-            }
-            rows.append(row)
+                "ptspct": point_percentage, "winpct": win_percentage,
+                "pythag": pythag, "xP": xP, "xW": xW, "xvrP": xvrP, "xvrW": xvrW,
+                "pace": pace, "xTP": xTP, "l10pythag": l10pythag,
+            })
         except Exception:
             continue
 
-    # Sort default view: by division, then points desc, then wins, then goal diff
-    rows.sort(key=lambda r: (r["division"], -r["pts"], -r["w"], -r["diff"]))
+    # Sensible default sort (PTS desc, then W, then GD)
+    rows.sort(key=lambda r: (r["conference"], r["division"], r["pts"], r["w"], r["diff"]), reverse=True)
     return rows
 
 def write_html_standings(rows: List[dict], path: str, report_date: str):
     updated_time = datetime.now(tz=CENTRAL_TZ).strftime("%a, %b %d, %Y — %I:%M %p %Z")
 
-    # Group by division in preferred order
-    order = ["Atlantic", "Metropolitan", "Central", "Pacific"]
-    div_groups: Dict[str, List[dict]] = {d: [] for d in order}
-    other = []
+    # Group by conference then division
+    by_conf: Dict[str, Dict[str, List[dict]]] = {}
     for r in rows:
-        d = r.get("division") or "Unknown"
-        if d in div_groups:
-            div_groups[d].append(r)
-        else:
-            other.append(r)
-    if other:
-        div_groups["Other"] = other
-        order.append("Other")
+        c = r.get("conference", "Unknown Conference")
+        d = r.get("division", "Unknown Division")
+        by_conf.setdefault(c, {}).setdefault(d, []).append(r)
+
+    # Keep NHL-ish order if present; else alphabetical
+    def conf_order_key(c):
+        c_up = c.upper()
+        if "EAST" in c_up: return 0
+        if "WEST" in c_up: return 1
+        return 2
+    conferences = sorted(by_conf.keys(), key=lambda c: (conf_order_key(c), c))
 
     def tr(r):
         return f"""
@@ -812,29 +773,75 @@ def write_html_standings(rows: List[dict], path: str, report_date: str):
   <td data-val="{r['gf']}">{r['gf']}</td>
   <td data-val="{r['ga']}">{r['ga']}</td>
   <td data-val="{r['diff']}">{r['diff']:+d}</td>
-  <td data-val="{r['pyth']}">{r['pyth']:.3f}</td>
+  <td data-val="{r['pythag']}">{r['pythag']:.3f}</td>
   <td data-val="{r['xP']}">{r['xP']:.2f}</td>
   <td data-val="{r['xW']}">{r['xW']:.2f}</td>
   <td data-val="{r['xvrP']}">{r['xvrP']:+.2f}</td>
   <td data-val="{r['xvrW']}">{r['xvrW']:+.2f}</td>
   <td data-val="{r['pace']}">{r['pace']}</td>
   <td data-val="{r['xTP']}">{r['xTP']}</td>
-  <td data-val="{r['l10pyth']}">{r['l10pyth']:.3f}</td>
+  <td data-val="{r['l10pythag']}">{r['l10pythag']:.3f}</td>
 </tr>"""
 
-    # Build multiple TBODY blocks, each starts with a division header row
-    tbodies_html = []
-    for div in order:
-        group = div_groups.get(div) or []
-        if not group:
-            continue
-        rows_html = "\n".join(tr(r) for r in group)
-        tbodies_html.append(f"""
-<tbody data-division="{div}">
-  <tr class="divhead"><td colspan="19">{div} Division</td></tr>
-  {rows_html}
-</tbody>""")
-    body = "\n".join(tbodies_html)
+    # Build sections per conference/division
+    conf_sections = []
+    for conf in conferences:
+        divs = by_conf[conf]
+        # attempt NHL-ish division order
+        def div_order_key(d):
+            d_up = d.upper()
+            if "METRO" in d_up: return 0
+            if "ATLANT" in d_up: return 1
+            if "CENTRAL" in d_up: return 2
+            if "PACIFIC" in d_up: return 3
+            return 4
+        divisions = sorted(divs.keys(), key=lambda d: (div_order_key(d), d))
+
+        div_sections = []
+        for div in divisions:
+            body = "\n".join(tr(r) for r in divs[div])
+            div_sections.append(f"""
+<section class="division">
+  <h3 class="divhdr">{div}</h3>
+  <div class="card scroller">
+    <table class="standings" data-division="{div}">
+      <thead>
+        <tr>
+          <th data-key="team" class="nosort">Team</th>
+          <th data-key="gp">GP</th>
+          <th data-key="w">W</th>
+          <th data-key="l">L</th>
+          <th data-key="ot">OT</th>
+          <th data-key="pts">PTS</th>
+          <th data-key="ptspct">P%</th>
+          <th data-key="winpct">Win%</th>
+          <th data-key="gf">GF</th>
+          <th data-key="ga">GA</th>
+          <th data-key="diff">DIFF</th>
+          <th data-key="pythag">Pyth</th>
+          <th data-key="xP">xP</th>
+          <th data-key="xW">xW</th>
+          <th data-key="xvrP">xPΔ</th>
+          <th data-key="xvrW">xWΔ</th>
+          <th data-key="pace">Pace</th>
+          <th data-key="xTP">xTP</th>
+          <th data-key="l10pythag">L10 Pyth</th>
+        </tr>
+      </thead>
+      <tbody>
+        {body}
+      </tbody>
+    </table>
+  </div>
+</section>
+""")
+
+        conf_sections.append(f"""
+<section class="conference">
+  <h2 class="confhdr">{conf}</h2>
+  {''.join(div_sections)}
+</section>
+""")
 
     html = """
 <!doctype html>
@@ -852,4 +859,306 @@ h1{margin:0 0 18px;font-weight:800;letter-spacing:.3px}
 .nav{display:flex;gap:10px;margin:0 0 14px}
 .nav a{padding:8px 10px;border:1px solid var(--border);border-radius:10px;color:var(--muted);text-decoration:none}
 .nav a.active{background:linear-gradient(145deg,var(--panel),var(--panel2));color:#fff;border-color:var(--accent)}
-.card{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:16px;padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.25
+.confhdr{margin:18px 0 8px;font-size:20px;font-weight:900;letter-spacing:.3px;color:#fff}
+.divhdr{margin:14px 0 10px;font-size:16px;font-weight:800;letter-spacing:.2px;color:#fff}
+.card{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:16px;padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+.scroller{overflow:auto}
+table{width:100%;min-width:980px;border-collapse:separate;border-spacing:0 8px}
+thead th{text-align:left;font-weight:700;color:var(--muted);font-size:14px;padding:10px;border-bottom:1px solid var(--border);cursor:pointer;white-space:nowrap}
+tbody tr{background:rgba(255,255,255,.02);border:2px solid var(--border);border-radius:10px}
+tbody td{padding:10px;white-space:nowrap}
+.teamcell{display:flex;align-items:center;gap:10px}
+.teamcell .logo{width:28px;height:28px;object-fit:contain;filter:drop-shadow(0 1px 2px rgba(0,0,0,.4))}
+.teamcell .abbr{font-weight:700}
+.teamcell .name{color:var(--muted);font-size:12px}
+.footer{color:var(--muted);font-size:12px;margin-top:16px;text-align:left;line-height:1.5}
+.footer a{color:var(--accent);text-decoration:underline;font-weight:600}
+@media (max-width:700px){
+  thead th{font-size:12px}
+  tbody td{padding:8px}
+  .teamcell .name{display:none}
+  table{min-width:860px}
+}
+</style>
+</head>
+<body>
+<div class="wrapper">
+  <h1>NHL Standings — %%DATE%%</h1>
+  <div class="nav">
+    <a href="/">Predictions</a>
+    <a href="/standings" class="active">Standings</a>
+  </div>
+
+  %%CONFSECTIONS%%
+
+  <div class="footer">
+    <div>Last updated at: <strong>%%UPDATED%%</strong></div>
+    <div>Generated by <a href="https://x.com/reagankingisles">@ReaganKingIsles</a>. Logos © NHL/teams; loaded from NHL CDN.</div>
+  </div>
+</div>
+
+<script>
+// Sorting per table (per division)
+document.querySelectorAll('table.standings').forEach(function(tbl){
+  let dir = 1, lastKey = '';
+  function colIndexByKey(key){
+    const ths = Array.from(tbl.tHead.rows[0].cells);
+    return ths.findIndex(th => th.dataset.key === key) + 1;
+  }
+  function sortBy(key){
+    const idx = colIndexByKey(key);
+    if (!idx) return;
+    const rows = Array.from(tbl.tBodies[0].rows);
+    if (lastKey === key) dir = -dir; else { dir = 1; lastKey = key; }
+    rows.sort((a,b)=>{
+      if (key === 'team'){
+        const av = a.querySelector('.abbr').textContent, bv = b.querySelector('.abbr').textContent;
+        return dir * av.localeCompare(bv);
+      }
+      const aVal = parseFloat(a.querySelector(`td:nth-child(${idx})`)?.dataset.val ?? 'NaN');
+      const bVal = parseFloat(b.querySelector(`td:nth-child(${idx})`)?.dataset.val ?? 'NaN');
+      return dir * ((aVal>bVal)-(aVal<bVal));
+    });
+    rows.forEach(r=>tbl.tBodies[0].appendChild(r));
+  }
+  tbl.tHead.querySelectorAll('th').forEach(th=>{
+    if (!th.classList.contains('nosort')){
+      th.addEventListener('click', ()=> sortBy(th.dataset.key));
+    }
+  });
+});
+
+// Logo fallbacks
+document.querySelectorAll('img.logo').forEach(img=>{
+  let alts=[]; try{ alts=JSON.parse(img.dataset.alts||'[]'); }catch(e){}
+  let i=0; img.onerror=()=>{ if(i<alts.length){ img.src=alts[i++]; } else { img.style.visibility='hidden'; } };
+});
+</script>
+</body></html>
+"""
+    html = (html
+            .replace("%%DATE%%", report_date)
+            .replace("%%CONFSECTIONS%%", "\n".join(conf_sections))
+            .replace("%%UPDATED%%", updated_time))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+# =========================
+# Backtest + season-to-date
+# =========================
+def find_season_start(yesterday_local: datetime.date) -> datetime.date:
+    start_scan = datetime(yesterday_local.year, 9, 1, tzinfo=LOCAL_TZ).date()
+    d = start_scan
+    while d <= yesterday_local:
+        ds = d.strftime("%Y-%m-%d")
+        data = safe_get_json(API_SCORE_DATE.format(date=ds))
+        games = (data or {}).get("games") or []
+        has_regular = any(normalize_game_type((g or {}).get("gameType")) == "R" for g in games if isinstance(g, dict))
+        if has_regular:
+            return d
+        d += timedelta(days=1)
+    return max(yesterday_local - timedelta(days=7), start_scan)
+
+def backtest_this_season():
+    today_local = datetime.now(tz=LOCAL_TZ).date()
+    yesterday = today_local - timedelta(days=1)
+
+    season_start = find_season_start(yesterday)
+    logging.info(f"Backtest season start detected: {season_start}")
+
+    warm_start = datetime(season_start.year - 1, 10, 1, tzinfo=LOCAL_TZ).date()
+    state = {"elo": {}}
+    if warm_start <= (season_start - timedelta(days=1)):
+        build_elo_from_history(state, warm_start, season_start - timedelta(days=1), include_types=("R","P"))
+
+    rows = []
+    d = season_start
+    while d <= yesterday:
+        sched = [g for g in get_schedule_for_local_date(d) if (g.game_type or "R") == "R"]
+        for g in sched:
+            helo = state.get("elo", {}).get(g.home_key, ELO_INIT)
+            aelo = state.get("elo", {}).get(g.away_key, ELO_INIT)
+            hxg, axg = expected_goals(helo, aelo)
+            p_home, p_away = win_probs_from_skellam(hxg, axg)
+            rows.append({
+                "date": d.isoformat(),
+                "gameId": g.game_id,
+                "home_key": g.home_key,
+                "away_key": g.away_key,
+                "home_name": g.home_name,
+                "away_name": g.away_name,
+                "pred_p_home": p_home,
+                "pred_p_away": p_away,
+                "pred_xg_home": hxg,
+                "pred_xg_away": axg,
+            })
+        finals = get_finals_for_date(d.strftime("%Y-%m-%d"))
+        for gf in finals:
+            if (gf.game_type or "") != "R":
+                continue
+            if gf.home_key == "UNKNOWN" or gf.away_key == "UNKNOWN":
+                continue
+            update_elo(state, gf.home_key, gf.away_key, gf.home_score, gf.away_score,
+                       gf.date, datetime(d.year, d.month, d.day, tzinfo=LOCAL_TZ))
+        d += timedelta(days=1)
+
+    actuals: Dict[Tuple[str,str,str], Dict[str, Any]] = {}
+    d = season_start
+    while d <= yesterday:
+        for gf in get_finals_for_date(d.strftime("%Y-%m-%d")):
+            if (gf.game_type or "") != "R":
+                continue
+            k = (d.isoformat(), gf.home_key, gf.away_key)
+            actuals[k] = {"home_score": gf.home_score, "away_score": gf.away_score, "home_win": 1 if gf.home_score > gf.away_score else 0}
+        d += timedelta(days=1)
+
+    results = []
+    brier_sum = logloss_sum = 0.0
+    acc_sum = 0
+    mae_home_sum = mae_away_sum = mae_total_sum = 0.0
+    rmse_home_sq_sum = rmse_away_sq_sum = rmse_total_sq_sum = 0.0
+    n = 0
+
+    for r in rows:
+        key = (r["date"], r["home_key"], r["away_key"])
+        a = actuals.get(key)
+        if not a:
+            continue
+        p_home = max(1e-6, min(1-1e-6, r["pred_p_home"]))
+        home_win = a["home_win"]
+        brier = (p_home - home_win) ** 2
+        logloss = - (home_win * math.log(p_home) + (1 - home_win) * math.log(1 - p_home))
+        acc = 1 if ((p_home >= 0.5) == (home_win == 1)) else 0
+
+        pred_home = r["pred_xg_home"]; pred_away = r["pred_xg_away"]
+        act_home = a["home_score"];    act_away = a["away_score"]
+
+        err_home = pred_home - act_home
+        err_away = pred_away - act_away
+        err_total = (pred_home + pred_away) - (act_home + act_away)
+
+        mae_home_sum += abs(err_home); mae_away_sum += abs(err_away); mae_total_sum += abs(err_total)
+        rmse_home_sq_sum += err_home**2; rmse_away_sq_sum += err_away**2; rmse_total_sq_sum += err_total**2
+
+        results.append({
+            **r,
+            "home_score": act_home, "away_score": act_away, "home_win": home_win,
+            "picked_correct": acc, "brier": brier, "logloss": logloss,
+            "abs_err_home_goals": abs(err_home), "abs_err_away_goals": abs(err_away), "abs_err_total_goals": abs(err_total),
+        })
+
+        brier_sum += brier; logloss_sum += logloss; acc_sum += acc; n += 1
+
+    if n == 0:
+        logging.warning("Backtest found no regular-season games to evaluate.")
+        write_csv([], BACKTEST_CSV)
+        with open(BACKTEST_SUMMARY_JSON, "w") as f:
+            json.dump({"games_evaluated": 0}, f, indent=2)
+        return
+
+    brier = brier_sum / n; logloss = logloss_sum / n; accuracy = acc_sum / n
+    mae_home = mae_home_sum / n; mae_away = mae_away_sum / n; mae_total = mae_total_sum / n
+    rmse_home = math.sqrt(rmse_home_sq_sum / n); rmse_away = math.sqrt(rmse_away_sq_sum / n); rmse_total = math.sqrt(rmse_total_sq_sum / n)
+
+    for row in results:
+        for k in ("pred_p_home", "pred_p_away", "pred_xg_home", "pred_xg_away", "brier", "logloss",
+                  "abs_err_home_goals", "abs_err_away_goals", "abs_err_total_goals"):
+            row[k] = round(row[k], 4)
+    write_csv(results, BACKTEST_CSV)
+    summary = {
+        "games_evaluated": n, "accuracy": round(accuracy, 4), "brier": round(brier, 5), "logloss": round(logloss, 5),
+        "mae_home_goals": round(mae_home, 4), "mae_away_goals": round(mae_away, 4), "mae_total_goals": round(mae_total, 4),
+        "rmse_home_goals": round(rmse_home, 4), "rmse_away_goals": round(rmse_away, 4), "rmse_total_goals": round(rmse_total, 4),
+    }
+    with open(BACKTEST_SUMMARY_JSON, "w") as f:
+        json.dump(summary, f, indent=2)
+    logging.info(f"Backtest complete on {n} games. Acc={summary['accuracy']}, Brier={summary['brier']}, LogLoss={summary['logloss']}")
+
+def compute_season_record_to_date() -> Tuple[int, int, float]:
+    today_local = datetime.now(tz=LOCAL_TZ).date()
+    yesterday = today_local - timedelta(days=1)
+    if yesterday < datetime(today_local.year, 9, 1, tzinfo=LOCAL_TZ).date():
+        return (0, 0, 0.0)
+
+    season_start = find_season_start(yesterday)
+    warm_start = datetime(season_start.year - 1, 10, 1, tzinfo=LOCAL_TZ).date()
+    state = {"elo": {}}
+    if warm_start <= (season_start - timedelta(days=1)):
+        build_elo_from_history(state, warm_start, season_start - timedelta(days=1), include_types=("R","P"))
+
+    correct = total = 0
+    d = season_start
+    while d <= yesterday:
+        sched = [g for g in get_schedule_for_local_date(d) if (g.game_type or "R") == "R"]
+        finals = get_finals_for_date(d.strftime("%Y-%m-%d"))
+        for g in sched:
+            helo = state.get("elo", {}).get(g.home_key, ELO_INIT)
+            aelo = state.get("elo", {}).get(g.away_key, ELO_INIT)
+            hxg, axg = expected_goals(helo, aelo)
+            p_home, _ = win_probs_from_skellam(hxg, axg)
+            for gf in finals:
+                if (gf.game_type or "") != "R":
+                    continue
+                if gf.home_key == g.home_key and gf.away_key == g.away_key:
+                    total += 1
+                    home_win = gf.home_score > gf.away_score
+                    model_pick_home = p_home >= 0.5
+                    if model_pick_home == home_win:
+                        correct += 1
+                    break
+        for gf in finals:
+            if (gf.game_type or "") != "R":
+                continue
+            if gf.home_key == "UNKNOWN" or gf.away_key == "UNKNOWN":
+                continue
+            update_elo(state, gf.home_key, gf.away_key, gf.home_score, gf.away_score,
+                       gf.date, datetime(d.year, d.month, d.day, tzinfo=LOCAL_TZ))
+        d += timedelta(days=1)
+
+    pct = (correct / total * 100.0) if total else 0.0
+    return correct, total, pct
+
+# =========================
+# CLI / Main
+# =========================
+def parse_args():
+    import argparse
+    ap = argparse.ArgumentParser(description="NHL predictor + backtester")
+    ap.add_argument("--backtest-season", dest="backtest_season", action="store_true",
+                    help="Run a walk-forward backtest for this regular season (up to yesterday)")
+    return ap.parse_args()
+
+def main():
+    args = parse_args()
+    if args.backtest_season:
+        backtest_this_season()
+        return
+
+    # Daily prediction
+    today_local = datetime.now(tz=LOCAL_TZ).date()
+    start_date = datetime(today_local.year - 1, 10, 1, tzinfo=LOCAL_TZ).date()
+    end_date = today_local - timedelta(days=1)
+    state = {"elo": {}}
+    build_elo_from_history(state, start_date, end_date, include_types=("R","P"))
+
+    records = get_team_records()
+    correct, total, pct = compute_season_record_to_date()
+    season_line = f"Season to date: {correct}-{max(total - correct, 0)} ({pct:.1f}%)" if total else "Season to date: —"
+
+    preds = predict_day(state, today_local, records)
+    write_csv(preds, PREDICTIONS_CSV)
+    write_html(preds, PREDICTIONS_HTML, report_date=today_local.isoformat(), season_line=season_line)
+
+    print(f"Predictions for {today_local.isoformat()}:")
+    if preds:
+        for p in preds:
+            print(f"{p['away_key']} @ {p['home_key']} {p['local_time']}: "
+                  f"P(H)={p['p_home_win']:.3f}, P(A)={p['p_away_win']:.3f}, "
+                  f"ML(H)={p['ml_home']:+d}, ML(A)={p['ml_away']:+d}, "
+                  f"xG {p['pred_xg_away']:.2f}-{p['pred_xg_home']:.2f}")
+    else:
+        print("(no games found)")
+    print(f"\nSaved to {PREDICTIONS_CSV} and {PREDICTIONS_HTML}")
+
+if __name__ == "__main__":
+    main()
