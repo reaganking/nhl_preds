@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Daily NHL predictor + season backtester using api-web.nhle.com
+Also renders a Standings page.
 
 Run locally:
-  python app.py
-  python app.py --backtest-season
+  python app.py               # builds today's predictions HTML locally
+  python app.py --backtest-season  # produce backtest CSV + summary
 """
 
 import csv
@@ -31,6 +32,7 @@ HOME_ADV_ELO = 35.0
 LEAGUE_AVG_GOALS = 6.2
 ELO_TO_XG_SCALE = 0.0035
 RECENCY_TAU_DAYS = 180.0
+
 LOCAL_TZ = ZoneInfo("America/Chicago")
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 
@@ -55,7 +57,7 @@ def session_with_retries():
     retry = Retry(total=5, connect=5, read=5, backoff_factor=0.4,
                   status_forcelist=[429, 500, 502, 503, 504])
     s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.headers.update({"User-Agent": "nhl-predictor/3.0"})
+    s.headers.update({"User-Agent": "nhl-predictor/3.1"})
     return s
 
 SESSION = session_with_retries()
@@ -234,18 +236,6 @@ def win_probs_from_skellam(home_xg, away_xg) -> Tuple[float, float]:
         return 0.5, 0.5
     return p_home / s, p_away / s
 
-def modal_scoreline(home_xg: float, away_xg: float, max_goals: int = 10) -> Tuple[int, int]:
-    best_h, best_a, best_p = 0, 0, -1.0
-    ph = [math.exp(-home_xg) * (home_xg ** h) / math.factorial(h) for h in range(max_goals + 1)]
-    pa = [math.exp(-away_xg) * (away_xg ** a) / math.factorial(a) for a in range(max_goals + 1)]
-    for h in range(max_goals + 1):
-        for a in range(max_goals + 1):
-            p = ph[h] * pa[a]
-            if p > best_p:
-                best_p = p
-                best_h, best_a = h, a
-    return best_h, best_a
-
 # =========================
 # NHL API helpers (schedule/score)
 # =========================
@@ -369,7 +359,7 @@ def build_elo_from_history(state, start_date, end_date, include_types=("R","P","
     log_elo_summary(state)
 
 # =========================
-# Prediction + HTML
+# Prediction
 # =========================
 def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> List[Dict[str, Any]]:
     games = get_schedule_for_local_date(local_date)
@@ -380,7 +370,6 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
         aelo = state.get("elo", {}).get(away_key, ELO_INIT)
         hxg, axg = expected_goals(helo, aelo)
         p_home, p_away = win_probs_from_skellam(hxg, axg)
-        mh, ma = modal_scoreline(hxg, axg)
 
         ml_home = american_moneyline(p_home)
         ml_away = american_moneyline(p_away)
@@ -394,8 +383,6 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
             "home_name": g.home_name,
             "pred_xg_home": round(hxg, 2),
             "pred_xg_away": round(axg, 2),
-            "pred_mode_home": mh,
-            "pred_mode_away": ma,
             "p_home_win": round(p_home, 3),
             "p_away_win": round(p_away, 3),
             "ml_home": ml_home,
@@ -422,11 +409,14 @@ def write_csv(rows, path):
         w.writeheader()
         w.writerows(rows)
 
+# =========================
+# HTML: Predictions (no modal; responsive)
+# =========================
 def write_html(preds: List[Dict[str, Any]], path: str, report_date: str, season_line: Optional[str] = None):
     """
     Pretty HTML table with logos, retrying multiple logo URLs, % probs (one decimal),
     local time (browser-local via JS), team records. AWAY metrics first to align with top team.
-    Elo column removed. Responsive: tablet tweaks + stacked cards on mobile.
+    'Modal' removed; show only xG away/home. Includes nav to Standings. Responsive layout.
     """
     updated_time = datetime.now(tz=CENTRAL_TZ).strftime("%a, %b %d, %Y — %I:%M %p %Z")
 
@@ -435,12 +425,16 @@ def write_html(preds: List[Dict[str, Any]], path: str, report_date: str, season_
         html = """
 <!doctype html>
 <html><head><meta charset="utf-8"><title>NHL Predictions %%DATE%%</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root{--bg:#0b1020;--panel:#121933;--panel2:#0e1630;--txt:#e8ecff;--muted:#9fb1ff;--border:#1e2748;--border-strong:#29345e;--accent:#7aa2ff;}
 *{box-sizing:border-box}
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0}
-.wrapper{max-width:1100px;margin:32px auto;padding:0 16px}
-h1{font-weight:800;margin:0 0 16px}
+.wrapper{max-width:1150px;margin:28px auto;padding:0 16px}
+h1{font-weight:800;margin:0 0 16px;letter-spacing:.3px}
+.nav{display:flex;gap:10px;margin:0 0 14px}
+.nav a{padding:8px 10px;border:1px solid var(--border);border-radius:10px;color:var(--muted);text-decoration:none}
+.nav a.active{background:linear-gradient(145deg,var(--panel),var(--panel2));color:#fff;border-color:var(--accent)}
 .seasonline{color:var(--muted);margin:-6px 0 16px;font-weight:600}
 .card{background:#121933;border:1px solid #1e2748;border-radius:16px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 .empty{opacity:.85}
@@ -448,8 +442,13 @@ h1{font-weight:800;margin:0 0 16px}
 .footer a{color:var(--accent);text-decoration:underline;font-weight:600}
 .footer a:hover,.footer a:focus{text-decoration:none;filter:brightness(1.15)}
 </style></head>
-<body><div class="wrapper">
+<body>
+<div class="wrapper">
   <h1>NHL Predictions — %%DATE%%</h1>
+  <div class="nav">
+    <a href="/" class="active">Predictions</a>
+    <a href="/standings">Standings</a>
+  </div>
   %%SEASONLINE%%
   <div class="card empty">No games found.</div>
   <div class="footer">
@@ -464,7 +463,7 @@ h1{font-weight:800;margin:0 0 16px}
             f.write(html)
         return
 
-    # Row HTML builder (away-first alignment) — Elo removed from output
+    # Row HTML builder (away-first alignment) — no modal, xG only
     def row_html(p):
         ph = f"{p['p_home_win'] * 100:.1f}%"
         pa = f"{p['p_away_win'] * 100:.1f}%"
@@ -523,6 +522,9 @@ h1{font-weight:800;margin:0 0 16px}
 body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif}
 .wrapper{max-width:1150px;margin:28px auto;padding:0 16px}
 h1{margin:0 0 18px;font-weight:800;letter-spacing:.3px}
+.nav{display:flex;gap:10px;margin:0 0 14px}
+.nav a{padding:8px 10px;border:1px solid var(--border);border-radius:10px;color:var(--muted);text-decoration:none}
+.nav a.active{background:linear-gradient(145deg,var(--panel),var(--panel2));color:#fff;border-color:var(--accent)}
 .seasonline{color:var(--muted);margin:-6px 0 16px;font-weight:600}
 .subtitle{color:var(--muted);margin-bottom:18px}
 .table-card{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:16px;padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
@@ -577,6 +579,10 @@ b{color:#fff}
 <body>
   <div class="wrapper">
     <h1>NHL Predictions — %%DATE%%</h1>
+    <div class="nav">
+      <a href="/" class="active">Predictions</a>
+      <a href="/standings">Standings</a>
+    </div>
     %%SEASONLINE%%
     <div class="subtitle">Implied moneylines are vig-free (fair odds) derived from model probabilities.</div>
     <div class="table-card">
@@ -601,7 +607,7 @@ b{color:#fff}
     </div>
   </div>
 <script>
-// Try multiple logo URLs in order. If all fail, hide the image.
+// Try multiple logo URLs; if all fail, hide the image.
 document.querySelectorAll('img.logo').forEach(function(img){
   let alts = [];
   try { alts = JSON.parse(img.dataset.alts || '[]'); } catch(e) { alts = []; }
@@ -621,7 +627,7 @@ document.querySelectorAll('.time[data-utc]').forEach(function(el){
   }
 });
 
-// Daily auto-refresh at 03:10 local
+// Daily auto-refresh at 03:10 local (viewer)
 (function(){
   function msUntilNext(h, m){
     const now = new Date();
@@ -645,6 +651,190 @@ document.querySelectorAll('.time[data-utc]').forEach(function(el){
             .replace("%%SEASONLINE%%", season_html)
             .replace("%%UPDATED%%", updated_time))
 
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+# =========================
+# Standings: data + HTML (sortable)
+# =========================
+def fetch_standings_now() -> List[dict]:
+    """Return a flat list of team rows with basic stats for a sortable table."""
+    data = safe_get_json(API_STANDINGS_NOW) or {}
+    items = data.get("standings") or data.get("records") or data.get("teams") or []
+    rows: List[dict] = []
+    for it in items:
+        try:
+            abbr = (
+                (it.get("teamAbbrev") if isinstance(it.get("teamAbbrev"), str) else None)
+                or (it.get("teamAbbrev", {}) or {}).get("default")
+                or (it.get("team", {}) or {}).get("abbrev")
+                or (it.get("team", {}) or {}).get("triCode")
+                or ""
+            ).upper()
+            if not abbr:
+                continue
+
+            w = it.get("wins") or (it.get("record", {}) or {}).get("wins") or it.get("w") or 0
+            l = it.get("losses") or (it.get("record", {}) or {}).get("losses") or it.get("l") or 0
+            ot = (
+                it.get("otLosses") or it.get("overtimeLosses") or it.get("otl")
+                or (it.get("record", {}) or {}).get("ot") or (it.get("record", {}) or {}).get("overtimeLosses") or 0
+            )
+            gp = it.get("gamesPlayed") or (it.get("record", {}) or {}).get("gamesPlayed") or (w + l + ot)
+            pts = it.get("points") or (it.get("record", {}) or {}).get("points") or (2*w + ot)
+            gf  = it.get("goalsFor") or 0
+            ga  = it.get("goalsAgainst") or 0
+            row = {
+                "abbr": abbr,
+                "name": ((it.get("teamName") or {}) or {}).get("default") or ((it.get("team", {}) or {}).get("name")) or abbr,
+                "logo": primary_team_logo(abbr),
+                "logo_alts": json.dumps(team_logo_candidates(abbr)),
+                "gp": int(gp), "w": int(w), "l": int(l), "ot": int(ot),
+                "pts": int(pts), "gf": int(gf), "ga": int(ga),
+            }
+            row["diff"] = row["gf"] - row["ga"]
+            row["ptspct"] = round(row["pts"] / (2*row["gp"]), 3) if row["gp"] else 0.0
+            rows.append(row)
+        except Exception:
+            continue
+    rows.sort(key=lambda r: (r["pts"], r["w"], r["diff"]), reverse=True)
+    return rows
+
+def write_html_standings(rows: List[dict], path: str, report_date: str):
+    updated_time = datetime.now(tz=CENTRAL_TZ).strftime("%a, %b %d, %Y — %I:%M %p %Z")
+    def tr(r):
+        return f"""
+<tr>
+  <td class="teamcell">
+    <img class="logo" src="{r['logo']}" data-alts='{r['logo_alts']}' alt="{r['abbr']}" loading="lazy"/>
+    <span class="abbr">{r['abbr']}</span>
+    <span class="name">{r['name']}</span>
+  </td>
+  <td data-val="{r['gp']}">{r['gp']}</td>
+  <td data-val="{r['w']}">{r['w']}</td>
+  <td data-val="{r['l']}">{r['l']}</td>
+  <td data-val="{r['ot']}">{r['ot']}</td>
+  <td data-val="{r['pts']}"><b>{r['pts']}</b></td>
+  <td data-val="{r['gf']}">{r['gf']}</td>
+  <td data-val="{r['ga']}">{r['ga']}</td>
+  <td data-val="{r['diff']}">{r['diff']:+d}</td>
+  <td data-val="{r['ptspct']}">{r['ptspct']:.3f}</td>
+</tr>"""
+    body = "\n".join(tr(r) for r in rows)
+
+    html = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>NHL Standings %%DATE%%</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#0b1020;--panel:#121933;--panel2:#0e1630;--txt:#e8ecff;--muted:#9fb1ff;--border:#1e2748;--accent:#7aa2ff;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif}
+.wrapper{max-width:1150px;margin:28px auto;padding:0 16px}
+h1{margin:0 0 18px;font-weight:800;letter-spacing:.3px}
+.nav{display:flex;gap:10px;margin:0 0 14px}
+.nav a{padding:8px 10px;border:1px solid var(--border);border-radius:10px;color:var(--muted);text-decoration:none}
+.nav a.active{background:linear-gradient(145deg,var(--panel),var(--panel2));color:#fff;border-color:var(--accent)}
+.card{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:16px;padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+table{width:100%;border-collapse:separate;border-spacing:0 8px}
+thead th{text-align:left;font-weight:700;color:var(--muted);font-size:14px;padding:10px;border-bottom:1px solid var(--border);cursor:pointer}
+tbody tr{background:rgba(255,255,255,.02);border:2px solid var(--border);border-radius:10px}
+tbody td{padding:10px}
+.teamcell{display:flex;align-items:center;gap:10px}
+.teamcell .logo{width:28px;height:28px;object-fit:contain;filter:drop-shadow(0 1px 2px rgba(0,0,0,.4))}
+.teamcell .abbr{font-weight:700}
+.teamcell .name{color:var(--muted);font-size:12px}
+.footer{color:var(--muted);font-size:12px;margin-top:16px;text-align:left;line-height:1.5}
+.footer a{color:var(--accent);text-decoration:underline;font-weight:600}
+@media (max-width:700px){
+  thead th{font-size:12px}
+  tbody td{padding:8px}
+  .teamcell .name{display:none}
+}
+</style>
+</head>
+<body>
+<div class="wrapper">
+  <h1>NHL Standings — %%DATE%%</h1>
+  <div class="nav">
+    <a href="/">Predictions</a>
+    <a href="/standings" class="active">Standings</a>
+  </div>
+
+  <div class="card">
+    <table id="standings">
+      <thead>
+        <tr>
+          <th data-key="team" class="nosort">Team</th>
+          <th data-key="gp">GP</th>
+          <th data-key="w">W</th>
+          <th data-key="l">L</th>
+          <th data-key="ot">OT</th>
+          <th data-key="pts">PTS</th>
+          <th data-key="gf">GF</th>
+          <th data-key="ga">GA</th>
+          <th data-key="diff">DIFF</th>
+          <th data-key="ptspct">P%</th>
+        </tr>
+      </thead>
+      <tbody>
+        %%ROWS%%
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footer">
+    <div>Last updated at: <strong>%%UPDATED%%</strong></div>
+    <div>Generated by <a href="https://x.com/reagankingisles">@ReaganKingIsles</a>. Logos © NHL/teams; loaded from NHL CDN.</div>
+  </div>
+</div>
+
+<script>
+// sort headers
+(function(){
+  const tbl = document.getElementById('standings');
+  let dir = 1, lastKey = '';
+  function colIndexByKey(key){
+    const ths = Array.from(tbl.tHead.rows[0].cells);
+    return ths.findIndex(th => th.dataset.key === key) + 1;
+  }
+  function sortBy(key){
+    const idx = colIndexByKey(key);
+    if (!idx) return;
+    const rows = Array.from(tbl.tBodies[0].rows);
+    if (lastKey === key) dir = -dir; else { dir = 1; lastKey = key; }
+    rows.sort((a,b)=>{
+      if (key === 'team'){
+        const av = a.querySelector('.abbr').textContent, bv = b.querySelector('.abbr').textContent;
+        return dir * av.localeCompare(bv);
+      }
+      const aVal = parseFloat(a.querySelector(`td:nth-child(${idx})`)?.dataset.val ?? 'NaN');
+      const bVal = parseFloat(b.querySelector(`td:nth-child(${idx})`)?.dataset.val ?? 'NaN');
+      return dir * ((aVal>bVal)-(aVal<bVal));
+    });
+    rows.forEach(r=>tbl.tBodies[0].appendChild(r));
+  }
+  tbl.tHead.querySelectorAll('th').forEach(th=>{
+    if (!th.classList.contains('nosort')){
+      th.addEventListener('click', ()=> sortBy(th.dataset.key));
+    }
+  });
+})();
+
+// logo fallbacks
+document.querySelectorAll('img.logo').forEach(img=>{
+  let alts=[]; try{ alts=JSON.parse(img.dataset.alts||'[]'); }catch(e){}
+  let i=0; img.onerror=()=>{ if(i<alts.length){ img.src=alts[i++]; } else { img.style.visibility='hidden'; } };
+});
+</script>
+</body></html>
+"""
+    html = html.replace("%%DATE%%", report_date)\
+               .replace("%%ROWS%%", body)\
+               .replace("%%UPDATED%%", updated_time)
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -685,7 +875,6 @@ def backtest_this_season():
             aelo = state.get("elo", {}).get(g.away_key, ELO_INIT)
             hxg, axg = expected_goals(helo, aelo)
             p_home, p_away = win_probs_from_skellam(hxg, axg)
-            mh, ma = modal_scoreline(hxg, axg)
             rows.append({
                 "date": d.isoformat(),
                 "gameId": g.game_id,
@@ -697,8 +886,6 @@ def backtest_this_season():
                 "pred_p_away": p_away,
                 "pred_xg_home": hxg,
                 "pred_xg_away": axg,
-                "pred_mode_home": mh,
-                "pred_mode_away": ma,
             })
         finals = get_finals_for_date(d.strftime("%Y-%m-%d"))
         for gf in finals:
@@ -863,8 +1050,7 @@ def main():
             print(f"{p['away_key']} @ {p['home_key']} {p['local_time']}: "
                   f"P(H)={p['p_home_win']:.3f}, P(A)={p['p_away_win']:.3f}, "
                   f"ML(H)={p['ml_home']:+d}, ML(A)={p['ml_away']:+d}, "
-                  f"xG {p['pred_xg_away']:.2f}-{p['pred_xg_home']:.2f}, "
-                  f"Modal {p['pred_mode_away']}-{p['pred_mode_home']}")
+                  f"xG {p['pred_xg_away']:.2f}-{p['pred_xg_home']:.2f}")
     else:
         print("(no games found)")
     print(f"\nSaved to {PREDICTIONS_CSV} and {PREDICTIONS_HTML}")
