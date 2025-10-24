@@ -3,35 +3,8 @@ services:
     name: nhl-predictor
     env: python
     plan: free
-    region: ohio
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn server:app -w 2 -k gthread --threads 8 -t 120 -b 0.0.0.0:$PORT
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.6
       - key: REFRESH_TOKEN
-        generateValue: true          # Render generates a secure token for you
-      - key: SERVICE_URL
-        value: https://YOUR-SERVICE.onrender.com    # <-- set this after first deploy
-
-  - type: cron
-    name: nhl-predictor-daily-build
-    env: python
-    schedule: "0 9 * * *"            # 09:00 UTC ≈ 3:00am Central (DST note below)
-    buildCommand: pip install -r requirements.txt
-    startCommand: >
-      bash -lc 'curl -fsS "$SERVICE_URL/refresh?token=$REFRESH_TOKEN" || python generate_daily.py'
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.6
-  - type: cron
-    name: nhl-predictor-keep-alive
-    env: python
-    schedule: "*/30 * * * *"     # every 30 minutes
-    buildCommand: ""
-    startCommand: >
-      bash -lc 'curl -fsS "$SERVICE_URL/health" || true'
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.6
-
+        sync: false   # set this in Render Dashboard → Environment
