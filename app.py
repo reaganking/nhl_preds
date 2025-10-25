@@ -736,28 +736,93 @@ def fetch_standings_now() -> List[dict]:
     # Sensible default sort (PTS desc, then W, then GD)
     rows.sort(key=lambda r: (r["conference"], r["division"], r["pts"], r["w"], r["diff"]), reverse=True)
     return rows
+    
+def _div_code(name: str) -> str:
+    n = (name or "").lower()
+    if "atl" in n: return "ATL"
+    if "met" in n: return "MET"
+    if "cent" in n: return "CEN"
+    if "pac" in n: return "PAC"
+    return (name or "DIV")[:3].upper()
 
-def write_html_standings(rows: List[dict], path: str, report_date: str):
-    updated_time = datetime.now(tz=CENTRAL_TZ).strftime("%a, %b %d, %Y — %I:%M %p %Z")
+def _tie_key(r: dict):
+    # Division / WC ordering – mimic NHL.com roughly: PTS, then W, then goal diff
+    return (r["pts"], r["w"], r["diff"])
 
-    # Group by conference then division
+def mark_playoff_seeds(rows: List[dict]) -> None:
+    """
+    Mutates `rows` to add:
+      _seed: 'ATL-1' ... 'WC-2' or ''
+      _is_div_top3: bool
+      _is_wc: bool
+      _wc_rank: int or None
+    Grouping is by conference first, then division. Top 3 per division get seeded,
+    the rest compete for WC-1 and WC-2 inside their conference.
+    """
+    # Clear old flags
+    for r in rows:
+        r["_seed"] = ""
+        r["_is_div_top3"] = False
+        r["_is_wc"] = False
+        r["_wc_rank"] = None
+
+    # Build conf->div map
     by_conf: Dict[str, Dict[str, List[dict]]] = {}
     for r in rows:
         c = r.get("conference", "Unknown Conference")
         d = r.get("division", "Unknown Division")
         by_conf.setdefault(c, {}).setdefault(d, []).append(r)
 
-    # Keep NHL-ish order if present; else alphabetical
+    # Within each conference
+    for conf, divs in by_conf.items():
+        # Seed top-3 per division
+        leftovers: List[dict] = []
+        for div, teams in divs.items():
+            teams.sort(key=_tie_key, reverse=True)
+            for i, t in enumerate(teams):
+                if i < 3:
+                    t["_seed"] = f"{_div_code(div)}-{i+1}"
+                    t["_is_div_top3"] = True
+                else:
+                    leftovers.append(t)
+
+        # Wild cards (across whole conference)
+        leftovers.sort(key=_tie_key, reverse=True)
+        for i, t in enumerate(leftovers, start=1):
+            t["_wc_rank"] = i
+            if i <= 2:
+                t["_is_wc"] = True
+                t["_seed"] = f"WC-{i}"
+
+def write_html_standings(rows: List[dict], path: str, report_date: str):
+    updated_time = datetime.now(tz=CENTRAL_TZ).strftime("%a, %b %d, %Y — %I:%M %p %Z")
+
+    # Tag playoff seeds in-place
+    mark_playoff_seeds(rows)
+
+    # Group by conference -> division
+    by_conf: Dict[str, Dict[str, List[dict]]] = {}
+    for r in rows:
+        c = r.get("conference", "Unknown Conference")
+        d = r.get("division", "Unknown Division")
+        by_conf.setdefault(c, {}).setdefault(d, []).append(r)
+
     def conf_order_key(c):
-        c_up = c.upper()
-        if "EAST" in c_up: return 0
-        if "WEST" in c_up: return 1
+        cu = c.upper()
+        if "EAST" in cu: return 0
+        if "WEST" in cu: return 1
         return 2
     conferences = sorted(by_conf.keys(), key=lambda c: (conf_order_key(c), c))
 
-    def tr(r):
+    # Row HTML (adds Seed cell + qualifying highlight)
+    def tr(r, extra_classes: str = "") -> str:
+        qclass = " q" if (r.get("_is_div_top3") or r.get("_is_wc")) else ""
+        cls = (extra_classes + qclass).strip()
+        cls_attr = f' class="{cls}"' if cls else ""
+        seed = r.get("_seed", "")
         return f"""
-<tr>
+<tr{cls_attr}>
+  <td class="seed" data-val="{seed}">{seed}</td>
   <td class="teamcell">
     <img class="logo" src="{r['logo']}" data-alts='{r['logo_alts']}' alt="{r['abbr']}" loading="lazy"/>
     <span class="abbr">{r['abbr']}</span>
@@ -783,51 +848,59 @@ def write_html_standings(rows: List[dict], path: str, report_date: str):
   <td data-val="{r['l10pythag']}">{r['l10pythag']:.3f}</td>
 </tr>"""
 
-    # Build sections per conference/division
+    # Division table header (adds Seed col)
+    def thead() -> str:
+        return """
+<thead>
+  <tr>
+    <th data-key="seed">Seed</th>
+    <th data-key="team" class="nosort">Team</th>
+    <th data-key="gp">GP</th>
+    <th data-key="w">W</th>
+    <th data-key="l">L</th>
+    <th data-key="ot">OT</th>
+    <th data-key="pts">PTS</th>
+    <th data-key="ptspct">P%</th>
+    <th data-key="winpct">Win%</th>
+    <th data-key="gf">GF</th>
+    <th data-key="ga">GA</th>
+    <th data-key="diff">DIFF</th>
+    <th data-key="pythag">Pyth</th>
+    <th data-key="xP">xP</th>
+    <th data-key="xW">xW</th>
+    <th data-key="xvrP">xPΔ</th>
+    <th data-key="xvrW">xWΔ</th>
+    <th data-key="pace">Pace</th>
+    <th data-key="xTP">xTP</th>
+    <th data-key="l10pythag">L10 Pyth</th>
+  </tr>
+</thead>"""
+
+    # Build HTML sections for each conference
     conf_sections = []
     for conf in conferences:
         divs = by_conf[conf]
-        # attempt NHL-ish division order
+
         def div_order_key(d):
-            d_up = d.upper()
-            if "METRO" in d_up: return 0
-            if "ATLANT" in d_up: return 1
-            if "CENTRAL" in d_up: return 2
-            if "PACIFIC" in d_up: return 3
+            du = d.upper()
+            if "METRO" in du: return 0
+            if "ATLANT" in du: return 1
+            if "CENTRAL" in du: return 2
+            if "PACIFIC" in du: return 3
             return 4
         divisions = sorted(divs.keys(), key=lambda d: (div_order_key(d), d))
 
-        div_sections = []
+        # Division tables (show seed on top-3)
+        div_tables = []
         for div in divisions:
-            body = "\n".join(tr(r) for r in divs[div])
-            div_sections.append(f"""
+            teams = sorted(divs[div], key=_tie_key, reverse=True)
+            body = "\n".join(tr(t) for t in teams)
+            div_tables.append(f"""
 <section class="division">
   <h3 class="divhdr">{div}</h3>
   <div class="card scroller">
     <table class="standings" data-division="{div}">
-      <thead>
-        <tr>
-          <th data-key="team" class="nosort">Team</th>
-          <th data-key="gp">GP</th>
-          <th data-key="w">W</th>
-          <th data-key="l">L</th>
-          <th data-key="ot">OT</th>
-          <th data-key="pts">PTS</th>
-          <th data-key="ptspct">P%</th>
-          <th data-key="winpct">Win%</th>
-          <th data-key="gf">GF</th>
-          <th data-key="ga">GA</th>
-          <th data-key="diff">DIFF</th>
-          <th data-key="pythag">Pyth</th>
-          <th data-key="xP">xP</th>
-          <th data-key="xW">xW</th>
-          <th data-key="xvrP">xPΔ</th>
-          <th data-key="xvrW">xWΔ</th>
-          <th data-key="pace">Pace</th>
-          <th data-key="xTP">xTP</th>
-          <th data-key="l10pythag">L10 Pyth</th>
-        </tr>
-      </thead>
+      {thead()}
       <tbody>
         {body}
       </tbody>
@@ -836,13 +909,40 @@ def write_html_standings(rows: List[dict], path: str, report_date: str):
 </section>
 """)
 
+        # Wild Card table (all non-top-3 in this conference)
+        conf_rows = [r for d in divisions for r in by_conf[conf][d]]
+        wc_pool = [r for r in conf_rows if not r.get("_is_div_top3")]
+        wc_pool.sort(key=_tie_key, reverse=True)
+
+        def wc_tr(r, idx):
+            # Add a cutline before row #3 (i.e., after WC-2)
+            cutclass = " cutline" if idx == 3 else ""
+            return tr(r, extra_classes=("wc" + cutclass))
+
+        wc_body = "\n".join(wc_tr(r, i+1) for i, r in enumerate(wc_pool))
+        wc_table = f"""
+<section class="wild">
+  <h3 class="divhdr">Wild Card</h3>
+  <div class="card scroller">
+    <table class="standings wild" data-division="Wild Card">
+      {thead()}
+      <tbody>
+        {wc_body}
+      </tbody>
+    </table>
+  </div>
+</section>
+"""
+
         conf_sections.append(f"""
 <section class="conference">
   <h2 class="confhdr">{conf}</h2>
-  {''.join(div_sections)}
+  {''.join(div_tables)}
+  {wc_table}
 </section>
 """)
 
+    # Page shell
     html = """
 <!doctype html>
 <html>
@@ -851,7 +951,7 @@ def write_html_standings(rows: List[dict], path: str, report_date: str):
 <title>NHL Standings %%DATE%%</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-:root{--bg:#0b1020;--panel:#121933;--panel2:#0e1630;--txt:#e8ecff;--muted:#9fb1ff;--border:#1e2748;--accent:#7aa2ff;}
+:root{--bg:#0b1020;--panel:#121933;--panel2:#0e1630;--txt:#e8ecff;--muted:#9fb1ff;--border:#1e2748;--accent:#7aa2ff;--cut:#7aa2ff55;}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif}
 .wrapper{max-width:1150px;margin:28px auto;padding:0 16px}
@@ -859,14 +959,18 @@ h1{margin:0 0 18px;font-weight:800;letter-spacing:.3px}
 .nav{display:flex;gap:10px;margin:0 0 14px}
 .nav a{padding:8px 10px;border:1px solid var(--border);border-radius:10px;color:var(--muted);text-decoration:none}
 .nav a.active{background:linear-gradient(145deg,var(--panel),var(--panel2));color:#fff;border-color:var(--accent)}
-.confhdr{margin:18px 0 8px;font-size:20px;font-weight:900;letter-spacing:.3px;color:#fff}
-.divhdr{margin:14px 0 10px;font-size:16px;font-weight:800;letter-spacing:.2px;color:#fff}
+.confhdr{margin:18px 0 8px;font-size:20px;font-weight:900;letter-spacing:.3px}
+.divhdr{margin:14px 0 10px;font-size:16px;font-weight:800;letter-spacing:.2px}
 .card{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:16px;padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 .scroller{overflow:auto}
 table{width:100%;min-width:980px;border-collapse:separate;border-spacing:0 8px}
 thead th{text-align:left;font-weight:700;color:var(--muted);font-size:14px;padding:10px;border-bottom:1px solid var(--border);cursor:pointer;white-space:nowrap}
 tbody tr{background:rgba(255,255,255,.02);border:2px solid var(--border);border-radius:10px}
+tbody tr.q{background:rgba(122,162,255,.08);border-color:#2a3a6e}
+tbody tr.wc.q{background:rgba(122,162,255,.10);border-color:#3350a0}
+tbody tr.cutline td{border-top:2px solid var(--cut)}
 tbody td{padding:10px;white-space:nowrap}
+.seed{font-weight:800;color:#fff}
 .teamcell{display:flex;align-items:center;gap:10px}
 .teamcell .logo{width:28px;height:28px;object-fit:contain;filter:drop-shadow(0 1px 2px rgba(0,0,0,.4))}
 .teamcell .abbr{font-weight:700}
@@ -877,7 +981,7 @@ tbody td{padding:10px;white-space:nowrap}
   thead th{font-size:12px}
   tbody td{padding:8px}
   .teamcell .name{display:none}
-  table{min-width:860px}
+  table{min-width:900px}
 }
 </style>
 </head>
@@ -898,7 +1002,7 @@ tbody td{padding:10px;white-space:nowrap}
 </div>
 
 <script>
-// Sorting per table (per division)
+// Sorting per-table
 document.querySelectorAll('table.standings').forEach(function(tbl){
   let dir = 1, lastKey = '';
   function colIndexByKey(key){
@@ -927,7 +1031,6 @@ document.querySelectorAll('table.standings').forEach(function(tbl){
     }
   });
 });
-
 // Logo fallbacks
 document.querySelectorAll('img.logo').forEach(img=>{
   let alts=[]; try{ alts=JSON.parse(img.dataset.alts||'[]'); }catch(e){}
@@ -942,6 +1045,7 @@ document.querySelectorAll('img.logo').forEach(img=>{
             .replace("%%UPDATED%%", updated_time))
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
+
 
 # =========================
 # Backtest + season-to-date
