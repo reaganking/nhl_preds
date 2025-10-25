@@ -11,9 +11,13 @@ from app import (
     predict_day,
     write_html,
     compute_season_record_to_date,
-    fetch_standings_now,
+    get_standings_now_rows,
+    simulate_playoff_probs,
+    attach_po_to_rows,
     write_html_standings,
     LOCAL_TZ,
+    CENTRAL_TZ,
+    ELO_INIT,
 )
 
 app = Flask(__name__)
@@ -28,21 +32,20 @@ _cached = {          # predictions
 _cached_standings = { "date": None, "html": None }
 
 REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "")
-CENTRAL_TZ = ZoneInfo("America/Chicago")
 PRED_HTML_PATH = "/tmp/predictions.html"
 STAND_HTML_PATH = "/tmp/standings.html"
-
+SIMS = int(os.environ.get("SIMS", "300"))
+OT_RATE = float(os.environ.get("OT_RATE", "0.23"))
 
 def _today_local():
     return datetime.now(tz=LOCAL_TZ).date()
 
-
 def _generate_predictions_html_for(date_obj):
-    # Build Elo up to yesterday
+    # Elo to yesterday
     start_date = datetime(date_obj.year - 1, 10, 1, tzinfo=LOCAL_TZ).date()
     end_date = date_obj - timedelta(days=1)
     state = {"elo": {}}
-    build_elo_from_history(state, start_date, end_date, include_types=("R", "P"))
+    build_elo_from_history(state, start_date, end_date, include_types=("R","P"))
 
     # Records + season line
     records = get_team_records()
@@ -62,16 +65,22 @@ def _generate_predictions_html_for(date_obj):
     _cached["updated_ct"] = datetime.now(tz=CENTRAL_TZ).strftime("%a, %b %d, %Y — %I:%M %p %Z")
     return html
 
-
 def _generate_standings_html_for(date_obj):
-    rows = fetch_standings_now()
+    # Rebuild Elo to yesterday (for PO% simulation)
+    start_date = datetime(date_obj.year - 1, 10, 1, tzinfo=LOCAL_TZ).date()
+    end_date = date_obj - timedelta(days=1)
+    state = {"elo": {}}
+    build_elo_from_history(state, start_date, end_date, include_types=("R","P"))
+
+    rows = get_standings_now_rows()
+    po = simulate_playoff_probs(state, rows, date_obj, sims=SIMS, ot_rate=OT_RATE)
+    attach_po_to_rows(rows, po)
     write_html_standings(rows, STAND_HTML_PATH, report_date=date_obj.isoformat())
     with open(STAND_HTML_PATH, "r", encoding="utf-8") as f:
         html = f.read()
     _cached_standings["date"] = date_obj
     _cached_standings["html"] = html
     return html
-
 
 def _warm_now():
     try:
@@ -81,12 +90,10 @@ def _warm_now():
     except Exception:
         pass
 
-
 @app.route("/")
 def index():
     today = _today_local()
 
-    # Try disk cache on cold start
     if not _cached["html"]:
         try:
             with open(PRED_HTML_PATH, "r", encoding="utf-8") as f:
@@ -102,11 +109,9 @@ def index():
 
     return Response(_cached["html"], mimetype="text/html")
 
-
 @app.route("/standings")
 def standings():
     if not _cached_standings["html"]:
-        # try disk fallback
         try:
             with open(STAND_HTML_PATH, "r", encoding="utf-8") as f:
                 _cached_standings["html"] = f.read()
@@ -114,27 +119,23 @@ def standings():
             _generate_standings_html_for(_today_local())
     return Response(_cached_standings["html"], mimetype="text/html")
 
-
 @app.route("/refresh")
 def refresh():
-    """Synchronous rebuild; small body 'OK'."""
     token = request.args.get("token", "")
     if REFRESH_TOKEN and token != REFRESH_TOKEN:
         abort(403)
-    _generate_predictions_html_for(_today_local())
-    _generate_standings_html_for(_today_local())
+    today = _today_local()
+    _generate_predictions_html_for(today)
+    _generate_standings_html_for(today)
     return Response("OK\n", mimetype="text/plain")
-
 
 @app.route("/warm")
 def warm():
-    """Background rebuild; zero-byte 204 for cron-job.org."""
     token = request.args.get("token", "")
     if REFRESH_TOKEN and token != REFRESH_TOKEN:
         abort(403)
     Thread(target=_warm_now, daemon=True).start()
     return ("", 204)
-
 
 @app.route("/status.json")
 def status():
@@ -145,11 +146,9 @@ def status():
         "standings": {"date": sd, "ok": bool(_cached_standings["html"])},
     })
 
-
 @app.route("/health")
 def health():
     return "ok\n", 200
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
