@@ -4,3 +4,4 @@ requests>=2.31.0
 numpy==1.26.4
 scipy==1.11.4
 tzdata>=2025.1
+Flask-Compress==1.15
