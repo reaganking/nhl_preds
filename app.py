@@ -10,8 +10,10 @@ import json
 import math
 import logging
 import random
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, Tuple, List, Any, Optional, Set
 
 from zoneinfo import ZoneInfo
@@ -32,7 +34,7 @@ ELO_TO_XG_SCALE = 0.0035
 RECENCY_TAU_DAYS = 180.0
 
 # Playoff simulation parameters (tweak if needed)
-SIMS = 300                     # number of Monte Carlo seasons
+SIMS = 300                     # number of Monte Carlo seasons (full build)
 OT_RATE = 0.23                 # chance a simulated game goes OT/SO (loser gets 1 point)
 SCHEDULE_LOOKAHEAD_DAYS = 190  # scan forward for remaining schedule
 
@@ -54,6 +56,29 @@ API_STANDINGS_NOW = API_BASE + "/v1/standings/now"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 # =========================
+# Small disk cache (/tmp by default)
+# =========================
+CACHE_DIR = Path(os.environ.get("CACHE_DIR", "/tmp"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _cache_path(name: str) -> Path:
+    return CACHE_DIR / name
+
+def _read_json(path: Path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _write_json(path: Path, obj: Any):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+# =========================
 # Networking
 # =========================
 def session_with_retries():
@@ -61,7 +86,7 @@ def session_with_retries():
     retry = Retry(total=5, connect=5, read=5, backoff_factor=0.4,
                   status_forcelist=[429, 500, 502, 503, 504])
     s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.headers.update({"User-Agent": "nhl-predictor/3.4"})
+    s.headers.update({"User-Agent": "nhl-predictor/3.5"})
     return s
 
 SESSION = session_with_retries()
@@ -289,7 +314,17 @@ def get_schedule_for_local_date(local_date: datetime.date) -> List[GameSched]:
     return out
 
 def get_remaining_regular_season(today_local: datetime.date) -> List[GameSched]:
-    """Fetch remaining regular-season games (deduped) scanning week-by-week."""
+    """Fetch remaining regular-season games (deduped) scanning week-by-week, cached for the day."""
+    key = f"sched_{today_local.isoformat()}.json"
+    p = _cache_path(key)
+    cached = _read_json(p)
+    if cached and isinstance(cached, list):
+        out = []
+        for g in cached:
+            out.append(GameSched(**g))
+        logging.info(f"Remaining regular-season games (from cache): {len(out)}")
+        return out
+
     seen: Set[Any] = set()
     games: List[GameSched] = []
     for k in range(0, SCHEDULE_LOOKAHEAD_DAYS + 1, 7):
@@ -298,9 +333,7 @@ def get_remaining_regular_season(today_local: datetime.date) -> List[GameSched]:
         candidates = _iter_schedule_candidates(data)
         for g in candidates:
             gs = _parse_sched_item(g)
-            if not gs:
-                continue
-            if gs.game_type != "R":
+            if not gs or gs.game_type != "R":
                 continue
             dt_local = _utc_to_local_dt(gs.start_utc_str, LOCAL_TZ)
             if not dt_local or dt_local.date() < today_local:
@@ -309,11 +342,13 @@ def get_remaining_regular_season(today_local: datetime.date) -> List[GameSched]:
                 continue
             seen.add(gs.game_id)
             games.append(gs)
-    logging.info(f"Remaining regular-season games collected: {len(games)}")
+
+    _write_json(p, [g.__dict__ for g in games])
+    logging.info(f"Remaining regular-season games collected: {len(games)} (cached)")
     return games
 
 # =========================
-# History build
+# History build + cached Elo
 # =========================
 def log_elo_summary(state: dict):
     items = list(state.get("elo", {}).items())
@@ -357,6 +392,23 @@ def build_elo_from_history(state, start_date, end_date, include_types=("R","P","
         f"{len(state.get('elo', {}))} teams rated. {total} final games ingested."
     )
     log_elo_summary(state)
+
+def get_or_build_elo_cached(end_date: datetime.date):
+    """
+    Return {'elo': {...}} built from Oct 1 of previous season up to end_date.
+    Cached in /tmp/elo_YYYY-MM-DD.json
+    """
+    key = f"elo_{end_date.isoformat()}.json"
+    p = _cache_path(key)
+    cached = _read_json(p)
+    if cached and isinstance(cached, dict) and "elo" in cached:
+        return cached
+
+    start_date = datetime(end_date.year - 1, 10, 1, tzinfo=LOCAL_TZ).date()
+    state = {"elo": {}}
+    build_elo_from_history(state, start_date, end_date, include_types=("R","P"))
+    _write_json(p, state)
+    return state
 
 # =========================
 # Prediction + CSV/HTML
@@ -506,19 +558,22 @@ def get_standings_now_rows() -> List[dict]:
                 or "Unknown Division"
             )
 
-            # Advanced metrics
+            # Advanced metrics you asked for
             ptspct = round(pts / max(1, gp * 2), 3)
             winpct = round((w / max(1, gp)), 3)
+
             if (gf + ga) > 0:
                 pythag = round((gf ** 2.19) / ((gf ** 2.19) + (ga ** 2.19)), 3)
             else:
                 pythag = 0.500
+
             xP = round((gp * 2) * pythag, 2)
             xW = round(gp * pythag, 2)
             xvrP = round(pts - xP, 2)
             xvrW = round(w - xW, 2)
             pace = int(ptspct * 164)
             xTP = int(pythag * 164)
+
             if (l10_gf + l10_ga) > 0:
                 l10pythag = round((l10_gf ** 2.19) / ((l10_gf ** 2.19) + (l10_ga ** 2.19)), 3)
             else:
@@ -546,7 +601,6 @@ def get_standings_now_rows() -> List[dict]:
         except Exception:
             continue
 
-    # Sort mainly for display (PTS desc, then W, then GD)
     rows.sort(key=lambda r: (r["conference"], r["division"], r["pts"], r["w"], r["diff"]), reverse=True)
     return rows
 
@@ -585,39 +639,36 @@ def simulate_playoff_probs(state: dict,
             "division": r["division"],
         } for r in base_rows
     }
-
     remaining = get_remaining_regular_season(today_local)
 
     elo = state.get("elo", {})
     def _elo(k: str) -> float:
         return float(elo.get(k, ELO_INIT))
 
-    makes = {abbr: 0 for abbr in base.keys()}
+    # Precompute win probs once
+    pre = []
+    for g in remaining:
+        he, ae = _elo(g.home_key), _elo(g.away_key)
+        hxg, axg = expected_goals(he, ae)
+        p_home, _ = win_probs_from_skellam(hxg, axg)
+        pre.append((g.home_key, g.away_key, p_home))
 
-    rng = random.Random(12345)  # deterministic seed; change if wanted
+    makes = {abbr: 0 for abbr in base.keys()}
+    rng = random.Random(12345)
 
     for _ in range(sims):
         sim = {k: dict(v) for k, v in base.items()}
-
-        for g in remaining:
-            hk, ak = g.home_key, g.away_key
-            he, ae = _elo(hk), _elo(ak)
-            hxg, axg = expected_goals(he, ae)
-            p_home, p_away = win_probs_from_skellam(hxg, axg)
-
-            # Draw winner
+        for hk, ak, p_home in pre:
             if rng.random() < p_home:
                 sim[hk]["pts"] += 2
                 sim[hk]["w"] += 1
                 if rng.random() < ot_rate:
-                    sim[ak]["pts"] += 1  # OT/SO loss
+                    sim[ak]["pts"] += 1
             else:
                 sim[ak]["pts"] += 2
                 sim[ak]["w"] += 1
                 if rng.random() < ot_rate:
                     sim[hk]["pts"] += 1
-
-            # (Optional) you can update goal diff using sampled skellam scores if desired.
 
         sim_rows = [{
             "abbr": abbr,
@@ -641,7 +692,7 @@ def attach_po_to_rows(rows: List[dict], po: Dict[str, float]) -> None:
         r["po_str"] = f"{p*100:.1f}%"
 
 # =========================
-# Predictions HTML (same style as before, responsive)
+# Predictions HTML (xG only, responsive)
 # =========================
 def write_html(preds: List[Dict[str, Any]], path: str, report_date: str, season_line: Optional[str] = None):
     updated_time = datetime.now(tz=CENTRAL_TZ).strftime("%a, %b %d, %Y — %I:%M %p %Z")
@@ -862,7 +913,6 @@ def write_html_standings(rows: List[dict], path: str, report_date: str):
     conferences = sorted(by_conf.keys(), key=lambda c: (conf_order_key(c), c))
 
     def thead_html() -> str:
-        # Added PO% column here
         return """
 <thead>
   <tr>
@@ -928,7 +978,6 @@ def write_html_standings(rows: List[dict], path: str, report_date: str):
     conf_sections = []
     for conf in conferences:
         divs = by_conf[conf]
-        # graphical order
         def div_order_key(d):
             du = d.upper()
             if "METRO" in du: return 0
@@ -1094,7 +1143,7 @@ document.querySelectorAll('img.logo').forEach(img=>{
         f.write(html)
 
 # =========================
-# Backtest + season-to-date accuracy (unchanged)
+# Backtest + season-to-date accuracy (quick version)
 # =========================
 def find_season_start(yesterday_local: datetime.date) -> datetime.date:
     start_scan = datetime(yesterday_local.year, 9, 1, tzinfo=LOCAL_TZ).date()
@@ -1116,10 +1165,8 @@ def compute_season_record_to_date() -> Tuple[int, int, float]:
         return (0, 0, 0.0)
 
     season_start = find_season_start(yesterday)
-    warm_start = datetime(season_start.year - 1, 10, 1, tzinfo=LOCAL_TZ).date()
-    state = {"elo": {}}
-    if warm_start <= (season_start - timedelta(days=1)):
-        build_elo_from_history(state, warm_start, season_start - timedelta(days=1), include_types=("R","P"))
+    end_date = yesterday
+    state = get_or_build_elo_cached(end_date)
 
     correct = total = 0
     d = season_start
@@ -1144,16 +1191,6 @@ def compute_season_record_to_date() -> Tuple[int, int, float]:
                     if model_pick_home == home_win:
                         correct += 1
                     break
-        for gf in finals_games:
-            if (normalize_game_type(gf.get("gameType")) or "") != "R": continue
-            hk = canonical_team_key(gf.get("homeTeam", {}))
-            ak = canonical_team_key(gf.get("awayTeam", {}))
-            if hk == "UNKNOWN" or ak == "UNKNOWN": continue
-            update_elo(state, hk, ak,
-                       int(gf.get("homeTeam", {}).get("score", 0)),
-                       int(gf.get("awayTeam", {}).get("score", 0)),
-                       datetime.strptime(d.strftime("%Y-%m-%d"), "%Y-%m-%d"),
-                       datetime(d.year, d.month, d.day, tzinfo=LOCAL_TZ))
         d += timedelta(days=1)
 
     pct = (correct / total * 100.0) if total else 0.0
@@ -1172,16 +1209,13 @@ def parse_args():
 def main():
     args = parse_args()
     if args.backtest_season:
-        # if you still want to run the backtester, reuse prior code (omitted here for brevity)
         print("Backtester entry unchanged—use your earlier backtest function if desired.")
         return
 
-    # Build Elo up to yesterday
+    # Build Elo up to yesterday (cached)
     today_local = datetime.now(tz=LOCAL_TZ).date()
-    start_date = datetime(today_local.year - 1, 10, 1, tzinfo=LOCAL_TZ).date()
     end_date = today_local - timedelta(days=1)
-    state = {"elo": {}}
-    build_elo_from_history(state, start_date, end_date, include_types=("R","P"))
+    state = get_or_build_elo_cached(end_date)
 
     # Predictions page
     records = get_team_records()
