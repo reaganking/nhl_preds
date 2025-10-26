@@ -147,8 +147,16 @@ def warm():
     token = request.args.get("token", "")
     if REFRESH_TOKEN and token != REFRESH_TOKEN:
         abort(403)
-    Thread(target=_warm_now, daemon=True).start()
-    return ("", 204)
+    def task():
+        try:
+            app.logger.info("[warm] start")
+            _warm_now()
+            app.logger.info("[warm] done")
+        except Exception as e:
+            app.logger.exception("[warm] failed: %s", e)
+    Thread(target=task, daemon=True).start()
+    # Return 200 immediately (not 204) so monitors treat it as success
+    return Response("warming\n", mimetype="text/plain", status=200)
 
 @app.route("/status.json")
 def status():
@@ -167,6 +175,12 @@ def health():
 def ping():
     # As cheap as it gets; great for keep-alive services
     return ("", 204)
+
+@app.route("/ready")
+def ready():
+    ok_pred = bool(_cached.get("html"))
+    ok_stand = bool(_cached_standings.get("html"))
+    return jsonify({"predictions_ready": ok_pred, "standings_ready": ok_stand}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
