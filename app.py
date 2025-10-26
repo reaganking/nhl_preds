@@ -1159,38 +1159,75 @@ def find_season_start(yesterday_local: datetime.date) -> datetime.date:
     return max(yesterday_local - timedelta(days=7), start_scan)
 
 def compute_season_record_to_date() -> Tuple[int, int, float]:
+    """
+    Walk day-by-day from season start to yesterday.
+    For each date:
+      - read the official score feed (/v1/score/{date})
+      - keep only FINAL regular-season games
+      - compute model pick using Elo built through (date - 1)
+    Returns (correct, total, pct).
+    """
     today_local = datetime.now(tz=LOCAL_TZ).date()
     yesterday = today_local - timedelta(days=1)
     if yesterday < datetime(today_local.year, 9, 1, tzinfo=LOCAL_TZ).date():
         return (0, 0, 0.0)
 
+    # Find first date with regular-season games
     season_start = find_season_start(yesterday)
-    end_date = yesterday
-    state = get_or_build_elo_cached(end_date)
+
+    # Small memo so we don’t rebuild Elo repeatedly for the same date
+    elo_snapshots: Dict[datetime.date, dict] = {}
+
+    def elo_through(day_minus_one: datetime.date) -> dict:
+        if day_minus_one not in elo_snapshots:
+            elo_snapshots[day_minus_one] = get_or_build_elo_cached(day_minus_one)
+        return elo_snapshots[day_minus_one]
+
+    def final_regular_games(ds: str) -> List[dict]:
+        data = safe_get_json(API_SCORE_DATE.format(date=ds)) or {}
+        games = data.get("games") or []
+        finals = []
+        for g in games:
+            # Must be regular season AND final
+            if normalize_game_type(g.get("gameType")) != "R":
+                continue
+            st = (g.get("gameState") or "").upper()
+            if st not in {"FINAL", "OFF", "COMPLETE", "COMPLETED", "GAME_OVER"}:
+                continue
+            home = g.get("homeTeam", {}) or {}
+            away = g.get("awayTeam", {}) or {}
+            finals.append({
+                "home_key": canonical_team_key(home),
+                "away_key": canonical_team_key(away),
+                "home_score": int(home.get("score", 0)),
+                "away_score": int(away.get("score", 0)),
+            })
+        return finals
 
     correct = total = 0
     d = season_start
     while d <= yesterday:
-        sched = [g for g in get_schedule_for_local_date(d) if (g.game_type or "R") == "R"]
-        finals = safe_get_json(API_SCORE_DATE.format(date=d.strftime("%Y-%m-%d"))) or {}
-        finals_games = (finals.get("games") or [])
-        for g in sched:
-            helo = state.get("elo", {}).get(g.home_key, ELO_INIT)
-            aelo = state.get("elo", {}).get(g.away_key, ELO_INIT)
-            hxg, axg = expected_goals(helo, aelo)
-            p_home, _ = win_probs_from_skellam(hxg, axg)
-            for gf in finals_games:
-                if (normalize_game_type(gf.get("gameType")) or "") != "R": continue
-                hk = canonical_team_key(gf.get("homeTeam", {}))
-                ak = canonical_team_key(gf.get("awayTeam", {}))
-                if hk == g.home_key and ak == g.away_key:
-                    total += 1
-                    home_win = (int(gf.get("homeTeam", {}).get("score", 0)) >
-                                int(gf.get("awayTeam", {}).get("score", 0)))
-                    model_pick_home = p_home >= 0.5
-                    if model_pick_home == home_win:
-                        correct += 1
-                    break
+        ds = d.strftime("%Y-%m-%d")
+        finals = final_regular_games(ds)
+        if finals:
+            # Elo snapshot as of the morning of d == built through d-1
+            snap_date = d - timedelta(days=1)
+            state = elo_through(snap_date)
+            elo_map = state.get("elo", {}) or {}
+
+            for g in finals:
+                helo = float(elo_map.get(g["home_key"], ELO_INIT))
+                aelo = float(elo_map.get(g["away_key"], ELO_INIT))
+                hxg, axg = expected_goals(helo, aelo)
+                p_home, _ = win_probs_from_skellam(hxg, axg)
+
+                model_pick_home = (p_home >= 0.5)
+                actual_home_win = (g["home_score"] > g["away_score"])
+
+                total += 1
+                if model_pick_home == actual_home_win:
+                    correct += 1
+
         d += timedelta(days=1)
 
     pct = (correct / total * 100.0) if total else 0.0
