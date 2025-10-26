@@ -163,6 +163,11 @@ def status():
 def health():
     return "ok\n", 200
 
+@app.route("/ping")
+def ping():
+    # As cheap as it gets; great for keep-alive services
+    return ("", 204)
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
