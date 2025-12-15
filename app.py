@@ -23,7 +23,9 @@ from scipy.stats import skellam
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
 
 
 # =========================
