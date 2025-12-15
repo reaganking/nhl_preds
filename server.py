@@ -25,8 +25,8 @@ app = Flask(__name__)
 Compress(app)  # gzip/br
 
 # In-memory caches
-_cached = { "date": None, "html": None, "games": 0, "updated_ct": None }
-_cached_standings = { "date": None, "html": None, "stamp": None }
+_cached = {"date": None, "html": None, "games": 0, "updated_ct": None}
+_cached_standings = {"date": None, "html": None, "stamp": None}
 
 REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "")
 PRED_HTML_PATH = "/tmp/predictions.html"
@@ -37,8 +37,10 @@ FAST_SIMS = int(os.environ.get("FAST_SIMS", "120"))
 FULL_SIMS = int(os.environ.get("SIMS", "300"))
 OT_RATE = float(os.environ.get("OT_RATE", "0.23"))
 
+
 def _today_local():
     return datetime.now(tz=LOCAL_TZ).date()
+
 
 def _generate_predictions_html_for(date_obj):
     # Elo to yesterday (cached)
@@ -48,7 +50,11 @@ def _generate_predictions_html_for(date_obj):
     # Records + season line
     records = get_team_records()
     correct, total, pct = compute_season_record_to_date()
-    season_line = f"Season to date: {correct}-{max(total - correct, 0)} ({pct:.1f}%)" if total else "Season to date: —"
+    season_line = (
+        f"Season to date: {correct}-{max(total - correct, 0)} ({pct:.1f}%)"
+        if total
+        else "Season to date: —"
+    )
 
     preds = predict_day(state, date_obj, records)
     write_html(preds, PRED_HTML_PATH, report_date=date_obj.isoformat(), season_line=season_line)
@@ -56,62 +62,145 @@ def _generate_predictions_html_for(date_obj):
     with open(PRED_HTML_PATH, "r", encoding="utf-8") as f:
         html = f.read()
 
-    _cached.update({
-        "date": date_obj,
-        "html": html,
-        "games": len(preds),
-        "updated_ct": datetime.now(tz=CENTRAL_TZ).strftime("%a, %b %d, %Y — %I:%M %p %Z"),
-    })
+    _cached.update(
+        {
+            "date": date_obj,
+            "html": html,
+            "games": len(preds),
+            "updated_ct": datetime.now(tz=CENTRAL_TZ).strftime(
+                "%a, %b %d, %Y — %I:%M %p %Z"
+            ),
+        }
+    )
     return html
+
 
 def _generate_standings_html_for(date_obj, sims: int):
     # Elo to yesterday (cached)
     end_date = date_obj - timedelta(days=1)
     state = get_or_build_elo_cached(end_date)
 
-    rows = get_standings_now_rows()
-    po = simulate_playoff_probs(state, rows, date_obj, sims=sims, ot_rate=OT_RATE)
+    # Rows for standings + playoff sims
+    rows = get_standings_now_rows(state, date_obj)
+    po = simulate_playoff_probs(
+        state,
+        date_obj,
+        sims=sims,
+        ot_rate=OT_RATE,
+    )
     attach_po_to_rows(rows, po)
+
     write_html_standings(rows, STAND_HTML_PATH, report_date=date_obj.isoformat())
 
     with open(STAND_HTML_PATH, "r", encoding="utf-8") as f:
         html = f.read()
 
-    _cached_standings.update({
-        "date": date_obj,
-        "html": html,
-        "stamp": datetime.now(tz=CENTRAL_TZ),
-    })
+    _cached_standings.update(
+        {
+            "date": date_obj,
+            "html": html,
+            "stamp": datetime.now(tz=CENTRAL_TZ),
+        }
+    )
     return html
+
 
 def _warm_now():
     today = _today_local()
     _generate_predictions_html_for(today)
     _generate_standings_html_for(today, sims=FULL_SIMS)
 
+
+@app.before_first_request
+def _startup_warm():
+    """Kick off a background warm as soon as the service starts.
+
+    This avoids doing all the heavy Elo/simulation work in the first
+    user-facing request after a cold start.
+    """
+
+    def task():
+        try:
+            app.logger.info("[startup warm] begin")
+            _warm_now()
+            app.logger.info("[startup warm] done")
+        except Exception as e:
+            app.logger.exception("[startup warm] failed: %s", e)
+
+    Thread(target=task, daemon=True).start()
+
+
 @app.route("/")
 def index():
+    """Main predictions page.
+
+    If we have cached HTML (in memory or on disk), serve it immediately.
+    If not, trigger a background generation and return a lightweight
+    "warming up" page so the request never blocks for minutes on cold start.
+    """
     today = _today_local()
-    if not _cached["html"]:
-        try:
-            with open(PRED_HTML_PATH, "r", encoding="utf-8") as f:
-                _cached["html"] = f.read()
-                _cached["date"] = today
-        except Exception:
-            _generate_predictions_html_for(today)
+
+    # If HTML already cached in memory, just serve it
+    if _cached.get("html"):
+        resp = Response(_cached["html"], mimetype="text/html")
+        resp.headers["Cache-Control"] = "public, max-age=300"
+        return resp
+
+    # Try to load from disk cache first
+    try:
+        with open(PRED_HTML_PATH, "r", encoding="utf-8") as f:
+            _cached["html"] = f.read()
+            _cached["date"] = today
+    except Exception:
+        # Nothing cached yet – kick off a background build
+        def task():
+            try:
+                app.logger.info("[index warm] building predictions for %s", today)
+                _generate_predictions_html_for(today)
+                app.logger.info("[index warm] done")
+            except Exception as e:
+                app.logger.exception("[index warm] failed: %s", e)
+
+        Thread(target=task, daemon=True).start()
+
+        # Lightweight "warming up" page
+        html = """<!doctype html>
+<html>
+  <head><title>NHL Predictor – warming up</title></head>
+  <body style="font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem;">
+    <h1>NHL Predictor is warming up</h1>
+    <p>The service was asleep, so I'm rebuilding ratings and simulations.
+    This usually takes a minute or two. Please refresh the page shortly.</p>
+  </body>
+</html>"""
+        return Response(html, mimetype="text/html", status=200)
+
+    # Loaded from disk this request; now serve it
     resp = Response(_cached["html"], mimetype="text/html")
     resp.headers["Cache-Control"] = "public, max-age=300"
     return resp
 
+
 @app.route("/standings")
 def standings():
-    """Serve cached standings immediately. If cache is old (>2h), refresh in background."""
+    """Serve cached standings immediately.
+
+    If the cache is older than `stale_minutes`, refresh it in the background.
+    """
     now = datetime.now(tz=CENTRAL_TZ)
     stale_minutes = 120
+
     if _cached_standings["html"]:
         # Serve instantly; maybe refresh
-        if not _cached_standings["stamp"] or (now - _cached_standings["stamp"]).total_seconds() > stale_minutes * 60:
-            Thread(target=lambda: _generate_standings_html_for(_today_local(), sims=FAST_SIMS), daemon=True).start()
+        if not _cached_standings["stamp"] or (
+            now - _cached_standings["stamp"]
+        ).total_seconds() > stale_minutes * 60:
+            Thread(
+                target=lambda: _generate_standings_html_for(
+                    _today_local(), sims=FAST_SIMS
+                ),
+                daemon=True,
+            ).start()
         resp = Response(_cached_standings["html"], mimetype="text/html")
         resp.headers["Cache-Control"] = "public, max-age=900"
         return resp
@@ -121,19 +210,16 @@ def standings():
         with open(STAND_HTML_PATH, "r", encoding="utf-8") as f:
             _cached_standings["html"] = f.read()
             _cached_standings["date"] = _today_local()
-            _cached_standings["stamp"] = now
-            resp = Response(_cached_standings["html"], mimetype="text/html")
-            resp.headers["Cache-Control"] = "public, max-age=900"
-            return resp
     except Exception:
-        # Compute a FAST version synchronously, then return
-        html = _generate_standings_html_for(_today_local(), sims=FAST_SIMS)
-        resp = Response(html, mimetype="text/html")
-        resp.headers["Cache-Control"] = "public, max-age=900"
-        return resp
+        _generate_standings_html_for(_today_local(), sims=FAST_SIMS)
 
-@app.route("/refresh")
-def refresh():
+    resp = Response(_cached_standings["html"], mimetype="text/html")
+    resp.headers["Cache-Control"] = "public, max-age=900"
+    return resp
+
+
+@app.route("/force-warm")
+def force_warm():
     token = request.args.get("token", "")
     if REFRESH_TOKEN and token != REFRESH_TOKEN:
         abort(403)
@@ -142,11 +228,13 @@ def refresh():
     _generate_standings_html_for(today, sims=FULL_SIMS)
     return Response("OK\n", mimetype="text/plain")
 
+
 @app.route("/warm")
 def warm():
     token = request.args.get("token", "")
     if REFRESH_TOKEN and token != REFRESH_TOKEN:
         abort(403)
+
     def task():
         try:
             app.logger.info("[warm] start")
@@ -154,33 +242,46 @@ def warm():
             app.logger.info("[warm] done")
         except Exception as e:
             app.logger.exception("[warm] failed: %s", e)
+
     Thread(target=task, daemon=True).start()
     # Return 200 immediately (not 204) so monitors treat it as success
     return Response("warming\n", mimetype="text/plain", status=200)
+
 
 @app.route("/status.json")
 def status():
     d = _cached["date"].isoformat() if _cached["date"] else None
     sd = _cached_standings["date"].isoformat() if _cached_standings["date"] else None
-    return jsonify({
-        "predictions": {"date": d, "games": _cached["games"], "updated_ct": _cached["updated_ct"], "ok": bool(_cached["html"])},
-        "standings": {"date": sd, "ok": bool(_cached_standings["html"])},
-    })
+    return jsonify(
+        {
+            "predictions": {
+                "date": d,
+                "games": _cached["games"],
+                "updated_ct": _cached["updated_ct"],
+                "ok": bool(_cached["html"]),
+            },
+            "standings": {"date": sd, "ok": bool(_cached_standings["html"])},
+        }
+    )
+
 
 @app.route("/health")
 def health():
     return "ok\n", 200
+
 
 @app.route("/ping")
 def ping():
     # As cheap as it gets; great for keep-alive services
     return ("", 204)
 
+
 @app.route("/ready")
 def ready():
     ok_pred = bool(_cached.get("html"))
     ok_stand = bool(_cached_standings.get("html"))
     return jsonify({"predictions_ready": ok_pred, "standings_ready": ok_stand}), 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
