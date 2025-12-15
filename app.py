@@ -393,23 +393,67 @@ def build_elo_from_history(state, start_date, end_date, include_types=("R","P","
     )
     log_elo_summary(state)
 
-def get_or_build_elo_cached(end_date: datetime.date):
+def get_or_build_elo_cached(end_date):
     """
-    Return {'elo': {...}} built from Oct 1 of previous season up to end_date.
-    Cached in /tmp/elo_YYYY-MM-DD.json
+    Incrementally maintain Elo from Oct 1 of the previous season up to end_date.
+
+    Cache format:
+      {
+        "elo": {...},
+        "last_date": "YYYY-MM-DD"
+      }
+
+    We only build new Elo entries for the gap (last_date+1 → end_date).
+    Cache is stored in /tmp/elo_state.json.
     """
-    key = f"elo_{end_date.isoformat()}.json"
+    key = "elo_state.json"
     p = _cache_path(key)
+
     cached = _read_json(p)
+
+    # ---- LOAD EXISTING CACHE OR INITIALIZE NEW ONE ----
     if cached and isinstance(cached, dict) and "elo" in cached:
-        return cached
+        state = cached
+        last_date_str = cached.get("last_date")
+        try:
+            last_date = datetime.fromisoformat(last_date_str).date() if last_date_str else None
+        except:
+            last_date = None
+    else:
+        state = {"elo": {}, "last_date": None}
+        last_date = None
 
-    start_date = datetime(end_date.year - 1, 10, 1, tzinfo=LOCAL_TZ).date()
-    state = {"elo": {}}
-    build_elo_from_history(state, start_date, end_date, include_types=("R","P"))
+    # ---- IF ALREADY UP TO DATE, RETURN ----
+    if last_date and last_date >= end_date:
+        return state
+
+    # ---- DETERMINE START DATE FOR INCREMENTAL UPDATE ----
+    if last_date is None:
+        # First-ever build: start from Oct 1 of previous season
+        start_date = datetime(end_date.year - 1, 10, 1, tzinfo=LOCAL_TZ).date()
+    else:
+        # Incremental build: continue from day after last_date
+        start_date = last_date + timedelta(days=1)
+
+    # Safety: do nothing if somehow start_date > end_date
+    if start_date > end_date:
+        return state
+
+    # ---- PERFORM INCREMENTAL BUILD ----
+    app.logger.info(f"Elo incremental build from {start_date} to {end_date}")
+
+    build_elo_from_history(
+        state,
+        start_date,
+        end_date,
+        include_types=("R", "P")
+    )
+
+    # ---- SAVE UPDATED STATE ----
+    state["last_date"] = end_date.isoformat()
     _write_json(p, state)
-    return state
 
+    return state
 # =========================
 # Prediction + CSV/HTML
 # =========================
