@@ -2,7 +2,7 @@
 from flask import Flask, Response, request, abort, jsonify
 from flask_compress import Compress
 from datetime import datetime, timedelta
-from threading import Thread, Lock  # you already import Thread; just add Lock
+from threading import Thread, Lock
 
 _warm_lock = Lock()
 _pred_build_in_progress = False
@@ -36,7 +36,6 @@ REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "")
 PRED_HTML_PATH = "/tmp/predictions.html"
 STAND_HTML_PATH = "/tmp/standings.html"
 
-# Sim settings: fast for on-demand, fuller for cron warm
 FAST_SIMS = int(os.environ.get("FAST_SIMS", "120"))
 FULL_SIMS = int(os.environ.get("SIMS", "300"))
 OT_RATE = float(os.environ.get("OT_RATE", "0.23"))
@@ -47,7 +46,7 @@ def _today_local():
 
 
 def _generate_predictions_html_for(date_obj):
-    # Elo to yesterday (cached)
+    # Elo to yesterday (cached / incremental)
     end_date = date_obj - timedelta(days=1)
     state = get_or_build_elo_cached(end_date)
 
@@ -79,7 +78,7 @@ def _generate_predictions_html_for(date_obj):
 
 
 def _generate_standings_html_for(date_obj, sims: int):
-    # Elo to yesterday (cached)
+    # Elo to yesterday (cached / incremental)
     end_date = date_obj - timedelta(days=1)
     state = get_or_build_elo_cached(end_date)
 
@@ -145,7 +144,9 @@ def index():
                 _pred_build_in_progress = True
                 Thread(target=task, daemon=True).start()
             else:
-                app.logger.info("[index warm] already in progress; not starting another")
+                app.logger.info(
+                    "[index warm] already in progress; not starting another"
+                )
 
         html = """<!doctype html>
 <html>
