@@ -2,7 +2,11 @@
 from flask import Flask, Response, request, abort, jsonify
 from flask_compress import Compress
 from datetime import datetime, timedelta
-from threading import Thread
+from threading import Thread, Lock  # you already import Thread; just add Lock
+
+_warm_lock = Lock()
+_pred_build_in_progress = False
+
 from zoneinfo import ZoneInfo
 import os
 
@@ -121,15 +125,27 @@ def index():
             _cached["date"] = today
     except Exception:
         # Nothing cached yet – build in background and show a simple page
+        global _pred_build_in_progress
+
         def task():
+            global _pred_build_in_progress
             try:
                 app.logger.info("[index warm] building predictions for %s", today)
                 _generate_predictions_html_for(today)
                 app.logger.info("[index warm] done")
             except Exception as e:
                 app.logger.exception("[index warm] failed: %s", e)
+            finally:
+                with _warm_lock:
+                    _pred_build_in_progress = False
 
-        Thread(target=task, daemon=True).start()
+        # Only start the thread if one isn't already running
+        with _warm_lock:
+            if not _pred_build_in_progress:
+                _pred_build_in_progress = True
+                Thread(target=task, daemon=True).start()
+            else:
+                app.logger.info("[index warm] already in progress; not starting another")
 
         html = """<!doctype html>
 <html>
