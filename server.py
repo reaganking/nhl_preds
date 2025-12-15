@@ -89,16 +89,65 @@ def _warm_now():
     _generate_predictions_html_for(today)
     _generate_standings_html_for(today, sims=FULL_SIMS)
 
+@app.before_first_request
+def _startup_warm():
+    """Kick off a background warm as soon as the service starts."""
+    def task():
+        try:
+            app.logger.info("[startup warm] begin")
+            _warm_now()
+            app.logger.info("[startup warm] done")
+        except Exception as e:
+            app.logger.exception("[startup warm] failed: %s", e)
+
+    # Run in background so the app can start and bind the port immediately
+    Thread(target=task, daemon=True).start()
+
 @app.route("/")
 def index():
+    """Main predictions page with non-blocking cold start.
+
+    If cached HTML is available, serve it immediately.
+    If not, start a background generation and return a lightweight
+    "warming up" page so the request never blocks for minutes.
+    """
     today = _today_local()
-    if not _cached["html"]:
-        try:
-            with open(PRED_HTML_PATH, "r", encoding="utf-8") as f:
-                _cached["html"] = f.read()
-                _cached["date"] = today
-        except Exception:
-            _generate_predictions_html_for(today)
+
+    # If HTML already cached in memory, just serve it
+    if _cached.get("html"):
+        resp = Response(_cached["html"], mimetype="text/html")
+        resp.headers["Cache-Control"] = "public, max-age=300"
+        return resp
+
+    # Try disk cache first
+    try:
+        with open(PRED_HTML_PATH, "r", encoding="utf-8") as f:
+            _cached["html"] = f.read()
+            _cached["date"] = today
+    except Exception:
+        # Nothing cached yet – build in background and show a simple page
+        def task():
+            try:
+                app.logger.info("[index warm] building predictions for %s", today)
+                _generate_predictions_html_for(today)
+                app.logger.info("[index warm] done")
+            except Exception as e:
+                app.logger.exception("[index warm] failed: %s", e)
+
+        Thread(target=task, daemon=True).start()
+
+        html = """<!doctype html>
+<html>
+  <head><title>NHL Predictor – warming up</title></head>
+  <body style="font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem;">
+    <h1>NHL Predictor is warming up</h1>
+    <p>The service was asleep, so I'm rebuilding ratings and simulations.
+    This usually takes a minute or two. Please refresh the page shortly.</p>
+  </body>
+</html>"""
+        return Response(html, mimetype="text/html", status=200)
+
+    # Loaded from disk, now serve it
     resp = Response(_cached["html"], mimetype="text/html")
     resp.headers["Cache-Control"] = "public, max-age=300"
     return resp
