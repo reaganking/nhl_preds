@@ -10,6 +10,7 @@ import json
 import math
 import logging
 import random
+import time
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -55,6 +56,201 @@ API_STANDINGS_NOW = API_BASE + "/v1/standings/now"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+# =========================
+# Odds API (DraftKings) – cached + rate-limited
+# =========================
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
+ODDS_TTL_SECONDS = int(os.environ.get("ODDS_TTL_SECONDS", str(4 * 60 * 60)))  # 4 hours default
+ODDS_MAX_CALLS_PER_DAY = int(os.environ.get("ODDS_MAX_CALLS_PER_DAY", "6"))   # safety cap
+ODDS_API_BASE = "https://api.the-odds-api.com/v4/sports"
+
+def _odds_cache_paths(local_date: datetime.date):
+    base = Path("/tmp")
+    return (
+        base / f"odds_dk_{local_date.isoformat()}.json",
+        base / f"odds_calls_{local_date.isoformat()}.json",
+    )
+
+def _can_call_odds_api(local_date: datetime.date) -> bool:
+    _, calls_file = _odds_cache_paths(local_date)
+    data = {}
+    if calls_file.exists():
+        try:
+            data = json.loads(calls_file.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    n = int(data.get("calls", 0))
+    return n < ODDS_MAX_CALLS_PER_DAY
+
+def _record_odds_call(local_date: datetime.date) -> None:
+    _, calls_file = _odds_cache_paths(local_date)
+    data = {"calls": 0}
+    if calls_file.exists():
+        try:
+            data = json.loads(calls_file.read_text(encoding="utf-8"))
+        except Exception:
+            data = {"calls": 0}
+    data["calls"] = int(data.get("calls", 0)) + 1
+    calls_file.write_text(json.dumps(data), encoding="utf-8")
+
+def _norm_team_name(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.encode("ascii", "ignore").decode("ascii")  # Montréal -> Montreal
+    s = re.sub(r"[^a-z ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _decimal_to_american(dec: float):
+    if not dec or dec <= 1.0:
+        return None
+    if dec >= 2.0:
+        return int(round((dec - 1.0) * 100))
+    return int(round(-100.0 / (dec - 1.0)))
+
+def _fmt_american(ml):
+    if ml is None:
+        return "—"
+    return f"+{ml}" if ml > 0 else f"{ml}"
+
+def _implied_prob_raw(dec: float):
+    if not dec or dec <= 1.0:
+        return None
+    return 1.0 / dec
+
+def _no_vig_probs(dec_away: float, dec_home: float):
+    pa = _implied_prob_raw(dec_away)
+    ph = _implied_prob_raw(dec_home)
+    if pa is None or ph is None:
+        return None, None
+    s = pa + ph
+    if s <= 0:
+        return None, None
+    return pa / s, ph / s
+
+def _team_name_to_abbr_map() -> Dict[str, str]:
+    # Build from NHL standings payload so we don't maintain a manual dictionary.
+    data = safe_get_json(API_STANDINGS_NOW) or {}
+    items = data.get("standings") or data.get("records") or data.get("teams") or []
+    out: Dict[str, str] = {}
+    for it in items:
+        try:
+            abbr = (
+                (it.get("teamAbbrev") if isinstance(it.get("teamAbbrev"), str) else None)
+                or (it.get("teamAbbrev", {}) or {}).get("default")
+                or (it.get("team", {}) or {}).get("abbrev")
+                or (it.get("team", {}) or {}).get("triCode")
+                or ""
+            ).upper()
+            if not abbr:
+                continue
+            nm = full_team_name(it)  # e.g., "Anaheim Ducks"
+            out[_norm_team_name(nm)] = abbr
+        except Exception:
+            continue
+    return out
+
+def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Return DK h2h odds keyed by (away_abbr, home_abbr). Uses /tmp cache + daily cap."""
+    cache_file, _ = _odds_cache_paths(local_date)
+    now = time.time()
+
+    # 1) Fresh cache?
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            if (now - cached.get("_ts", 0)) < ODDS_TTL_SECONDS:
+                return cached.get("data", {})
+        except Exception:
+            pass
+
+    # 2) No key or cap reached → return stale cache if possible
+    if not ODDS_API_KEY or not _can_call_odds_api(local_date):
+        if cache_file.exists():
+            try:
+                cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                return cached.get("data", {})
+            except Exception:
+                return {}
+        return {}
+
+    # 3) Call Odds API
+    _record_odds_call(local_date)
+    url = f"{ODDS_API_BASE}/icehockey_nhl/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "us",
+        "markets": "h2h",
+        "oddsFormat": "decimal",
+        "dateFormat": "unix",
+        "bookmakers": "draftkings",
+    }
+
+    resp = SESSION.get(url, params=params, timeout=20)
+    resp.raise_for_status()
+    events = resp.json()
+
+    name_to_abbr = _team_name_to_abbr_map()
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    for ev in events:
+        try:
+            ct = ev.get("commence_time")
+            if not ct:
+                continue
+            dt_utc = datetime.fromtimestamp(int(ct), tz=timezone.utc)
+            dt_local = dt_utc.astimezone(LOCAL_TZ)
+            if dt_local.date() != local_date:
+                continue
+
+            home_name = ev.get("home_team")
+            teams = ev.get("teams") or []
+            if not home_name or len(teams) != 2:
+                continue
+            away_name = teams[0] if teams[1] == home_name else teams[1]
+
+            home_abbr = name_to_abbr.get(_norm_team_name(home_name))
+            away_abbr = name_to_abbr.get(_norm_team_name(away_name))
+            if not home_abbr or not away_abbr:
+                continue
+
+            sites = ev.get("sites") or ev.get("bookmakers") or []
+            dk = None
+            for s in sites:
+                if (s.get("site_key") or s.get("key")) == "draftkings":
+                    dk = s
+                    break
+            if not dk:
+                continue
+
+            odds = dk.get("odds") or {}
+            h2h = odds.get("h2h") or []
+            if len(h2h) != 2:
+                continue
+
+            away_idx = 0 if teams[0] == away_name else 1
+            home_idx = 0 if teams[0] == home_name else 1
+
+            dec_away = float(h2h[away_idx])
+            dec_home = float(h2h[home_idx])
+
+            ml_away = _decimal_to_american(dec_away)
+            ml_home = _decimal_to_american(dec_home)
+            p_nv_away, p_nv_home = _no_vig_probs(dec_away, dec_home)
+
+            out[(away_abbr, home_abbr)] = {
+                "ml_away": ml_away,
+                "ml_home": ml_home,
+                "p_novig_away": p_nv_away,
+                "p_novig_home": p_nv_home,
+                "last_update": dk.get("last_update"),
+            }
+        except Exception:
+            continue
+
+    cache_file.write_text(json.dumps({"_ts": now, "data": out}), encoding="utf-8")
+    return out
+
 
 # =========================
 # Small disk cache (/tmp by default)
@@ -494,6 +690,37 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
             "utc_time": g.start_utc_str,
             "game_type": g.game_type or "",
         })
+    # --- DraftKings lines (Odds API) ---
+    try:
+        dk = get_draftkings_h2h_for_date(local_date)
+    except Exception:
+        dk = {}
+
+    for p in preds:
+        k = (p.get("away_key"), p.get("home_key"))
+        dk_row = dk.get(k) if dk else None
+
+        if not dk_row:
+            p["dk_ml_away"] = None
+            p["dk_ml_home"] = None
+            p["dk_ml_away_str"] = "—"
+            p["dk_ml_home_str"] = "—"
+            p["dk_imp_away"] = None
+            p["dk_imp_home"] = None
+            p["dk_imp_away_str"] = "—"
+            p["dk_imp_home_str"] = "—"
+            continue
+
+        p["dk_ml_away"] = dk_row.get("ml_away")
+        p["dk_ml_home"] = dk_row.get("ml_home")
+        p["dk_ml_away_str"] = _fmt_american(p["dk_ml_away"])
+        p["dk_ml_home_str"] = _fmt_american(p["dk_ml_home"])
+
+        p["dk_imp_away"] = dk_row.get("p_novig_away")
+        p["dk_imp_home"] = dk_row.get("p_novig_home")
+        p["dk_imp_away_str"] = "—" if p["dk_imp_away"] is None else f"{p['dk_imp_away']*100:.1f}%"
+        p["dk_imp_home_str"] = "—" if p["dk_imp_home"] is None else f"{p['dk_imp_home']*100:.1f}%"
+
     return preds
 
 def write_csv(rows, path):
@@ -817,6 +1044,14 @@ h1{font-weight:800;margin:0 0 16px}
     <div>Away: <b>{p['ml_away']:+d}</b></div>
     <div>Home: <b>{p['ml_home']:+d}</b></div>
   </td>
+  <td class="dkml" data-label="DK ML">
+    <div>Away: <b>{p.get('dk_ml_away_str','—')}</b></div>
+    <div>Home: <b>{p.get('dk_ml_home_str','—')}</b></div>
+  </td>
+  <td class="dkimp" data-label="DK Imp%">
+    <div>Away: <b>{p.get('dk_imp_away_str','—')}</b></div>
+    <div>Home: <b>{p.get('dk_imp_home_str','—')}</b></div>
+  </td>
   <td class="xg" data-label="xG">
     <div>Away xG: <b>{p['pred_xg_away']:.2f}</b></div>
     <div>Home xG: <b>{p['pred_xg_home']:.2f}</b></div>
@@ -892,6 +1127,8 @@ b{color:#fff}
             <th>Matchup</th>
             <th>Win Prob</th>
             <th>Implied ML</th>
+            <th>DK ML</th>
+            <th>DK Imp%</th>
             <th>xG</th>
           </tr>
         </thead>
