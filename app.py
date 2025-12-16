@@ -996,7 +996,6 @@ def write_html_standings(rows: List[dict], path: str, report_date: str):
   <td class="teamcell">
     <img class="logo" src="{r['logo']}" data-alts='{r['logo_alts']}' alt="{r['abbr']}" loading="lazy"/>
     <span class="abbr">{r['abbr']}</span>
-    <span class="name">{r['name']}</span>
   </td>
   <td data-val="{r['gp']}">{r['gp']}</td>
   <td data-val="{r['w']}">{r['w']}</td>
@@ -1112,7 +1111,7 @@ tbody tr.wc.q{background:rgba(122,162,255,.10);border-color:#3350a0}
 tbody tr.cutline td{border-top:2px solid var(--cut)}
 tbody td{padding:10px;white-space:nowrap}
 .seed{font-weight:800;color:#fff}
-.teamcell{display:flex;align-items:center;gap:10px}
+.teamcell{display:flex;align-items:center;gap:8px}
 .teamcell .logo{width:28px;height:28px;object-fit:contain;filter:drop-shadow(0 1px 2px rgba(0,0,0,.4))}
 .teamcell .abbr{font-weight:700}
 .teamcell .name{color:var(--muted);font-size:12px}
