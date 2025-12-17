@@ -190,6 +190,9 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str
 
     # 3) Call API (v3 payload shape)
     _record_odds_call(local_date)
+    log = logging.getLogger(__name__)
+    log.info("[odds] fetching DK odds…")
+
     params = {
         "api_key": ODDS_API_KEY,
         "sport": "icehockey_nhl",
@@ -198,13 +201,22 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str
         "oddsFormat": "decimal",
         "dateFormat": "unix",
     }
-    resp = requests.get(ODDS_API_V3_URL, params=params, timeout=15)
+    # Use existing retry-enabled SESSION if available
+    try:
+        resp = SESSION.get(ODDS_API_V3_URL, params=params, timeout=15)
+    except NameError:
+        resp = requests.get(ODDS_API_V3_URL, params=params, timeout=15)
+
+    log.info(f"[odds] request url={resp.url}")
     resp.raise_for_status()
     payload = resp.json()
 
+    # v3 payload: {"success": true, "data": [...]}
     events = payload.get("data", []) if isinstance(payload, dict) else payload
     if not isinstance(events, list):
         events = []
+
+    log.info(f"[odds] events count={len(events)}")
 
     out: Dict[str, Dict[str, Any]] = {}
 
@@ -234,7 +246,7 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str
             continue
 
         sites = ev.get("sites") or ev.get("bookmakers") or []
-        dk = next((s for s in sites if (s.get("site_key") or s.get("key")) == "draftkings"), None)
+        dk = next((s for s in sites if (s.get("site_key") or s.get("key")) == "draftkings", None))
         if not dk:
             continue
 
@@ -245,12 +257,20 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str
         if not decimals or len(decimals) != 2:
             continue
 
-        # Odds API v3 aligns h2h order with "teams" order
-        away_idx = 0 if teams[0] == away_name else 1
-        home_idx = 0 if teams[0] == home_name else 1
+        # Odds API v3 aligns h2h order with the `teams` list.
+        # `teams` contains two names; `home_team` tells us which is home.
+        team0 = teams[0]
+        team1 = teams[1]
+        dec0 = float(decimals[0])
+        dec1 = float(decimals[1])
 
-        dec_away = float(decimals[away_idx])
-        dec_home = float(decimals[home_idx])
+        if team0 == home_name:
+            dec_home, dec_away = dec0, dec1
+        elif team1 == home_name:
+            dec_home, dec_away = dec1, dec0
+        else:
+            # If home_name doesn't match either team string, skip
+            continue
 
         ml_away = _decimal_to_american(dec_away)
         ml_home = _decimal_to_american(dec_home)
@@ -267,7 +287,7 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str
         }
 
     cache_file.write_text(json.dumps({"_ts": now, "data": out}), encoding="utf-8")
-    logging.getLogger(__name__).info(f"[odds] DK games mapped for {local_date}: {len(out)}")
+    log.info(f"[odds] DK games mapped for {local_date}: {len(out)}")
     return out
 BACKTEST_CSV = "backtest_results.csv"
 BACKTEST_SUMMARY_JSON = "backtest_summary.json"
@@ -684,6 +704,8 @@ def get_or_build_elo_cached(end_date):
 # =========================
 def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> List[Dict[str, Any]]:
     games = get_schedule_for_local_date(local_date)
+    # Pull DraftKings odds once per page build (cached + rate-limited)
+    dk_map = get_draftkings_h2h_for_date(local_date)
     preds = []
     for g in games:
         home_key, away_key = g.home_key, g.away_key
@@ -717,7 +739,23 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
             "local_time": fmt_local_time(_utc_to_local_dt(g.start_utc_str, LOCAL_TZ)),
             "utc_time": g.start_utc_str,
             "game_type": g.game_type or "",
+            # DraftKings odds (if available)
+            "dk_ml_away_str": "—",
+            "dk_ml_home_str": "—",
+            "dk_imp_away_str": "—",
+            "dk_imp_home_str": "—",
         })
+        # Attach DK odds via away@home key
+        k = f"{away_key}@{home_key}"
+        dk = dk_map.get(k)
+        if dk:
+            preds[-1]["dk_ml_away_str"] = _fmt_american(dk.get("ml_away"))
+            preds[-1]["dk_ml_home_str"] = _fmt_american(dk.get("ml_home"))
+
+            pa = dk.get("p_novig_away")
+            ph = dk.get("p_novig_home")
+            preds[-1]["dk_imp_away_str"] = f"{pa*100:.1f}%" if isinstance(pa, (int, float)) else "—"
+            preds[-1]["dk_imp_home_str"] = f"{ph*100:.1f}%" if isinstance(ph, (int, float)) else "—"
     return preds
 
 def write_csv(rows, path):
@@ -1103,8 +1141,8 @@ b{color:#fff}
   .team{gap:8px}
   .team img.logo{width:28px;height:28px}
   .vs{margin:6px 0 4px;font-size:11px}
-  td.prob,td.ml,td.xg{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 8px;white-space:normal}
-  td.prob::before,td.ml::before,td.xg::before{content:attr(data-label);color:var(--muted);font-weight:700;letter-spacing:.2px}
+  td.prob,td.ml,td.dkml,td.dkimp,td.xg{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 8px;white-space:normal}
+  td.prob::before,td.ml::before,td.dkml::before,td.dkimp::before,td.xg::before{content:attr(data-label);color:var(--muted);font-weight:700;letter-spacing:.2px}
 }
 </style>
 </head>
