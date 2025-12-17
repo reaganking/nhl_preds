@@ -56,6 +56,12 @@ ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
 ODDS_TTL_SECONDS = int(os.environ.get("ODDS_TTL_SECONDS", str(4 * 60 * 60)))
 ODDS_MAX_CALLS_PER_DAY = int(os.environ.get("ODDS_MAX_CALLS_PER_DAY", "6"))
 
+# Edge / best-bet display (env vars optional)
+#   ODDS_EDGE_HIGHLIGHT_PCT: highlight when abs(model_prob - DK_no_vig_prob) >= this (default 0.04 = 4%)
+#   ODDS_BEST_BET_MIN_EDGE_PCT: tag best bet only if top edge >= this (default 0.03 = 3%)
+ODDS_EDGE_HIGHLIGHT_PCT = float(os.environ.get("ODDS_EDGE_HIGHLIGHT_PCT", "0.04"))
+ODDS_BEST_BET_MIN_EDGE_PCT = float(os.environ.get("ODDS_BEST_BET_MIN_EDGE_PCT", "0.03"))
+
 # The Odds API v3-style endpoint (matches your {"success":true,"data":[...],"sites":[...]} payload)
 ODDS_API_V3_URL = "https://api.the-odds-api.com/v3/odds/"
 
@@ -190,9 +196,6 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str
 
     # 3) Call API (v3 payload shape)
     _record_odds_call(local_date)
-    log = logging.getLogger(__name__)
-    log.info("[odds] fetching DK odds…")
-
     params = {
         "api_key": ODDS_API_KEY,
         "sport": "icehockey_nhl",
@@ -201,22 +204,13 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str
         "oddsFormat": "decimal",
         "dateFormat": "unix",
     }
-    # Use existing retry-enabled SESSION if available
-    try:
-        resp = SESSION.get(ODDS_API_V3_URL, params=params, timeout=15)
-    except NameError:
-        resp = requests.get(ODDS_API_V3_URL, params=params, timeout=15)
-
-    log.info(f"[odds] request url={resp.url}")
+    resp = requests.get(ODDS_API_V3_URL, params=params, timeout=15)
     resp.raise_for_status()
     payload = resp.json()
 
-    # v3 payload: {"success": true, "data": [...]}
     events = payload.get("data", []) if isinstance(payload, dict) else payload
     if not isinstance(events, list):
         events = []
-
-    log.info(f"[odds] events count={len(events)}")
 
     out: Dict[str, Dict[str, Any]] = {}
 
@@ -257,20 +251,12 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str
         if not decimals or len(decimals) != 2:
             continue
 
-        # Odds API v3 aligns h2h order with the `teams` list.
-        # `teams` contains two names; `home_team` tells us which is home.
-        team0 = teams[0]
-        team1 = teams[1]
-        dec0 = float(decimals[0])
-        dec1 = float(decimals[1])
+        # Odds API v3 aligns h2h order with "teams" order
+        away_idx = 0 if teams[0] == away_name else 1
+        home_idx = 0 if teams[0] == home_name else 1
 
-        if team0 == home_name:
-            dec_home, dec_away = dec0, dec1
-        elif team1 == home_name:
-            dec_home, dec_away = dec1, dec0
-        else:
-            # If home_name doesn't match either team string, skip
-            continue
+        dec_away = float(decimals[away_idx])
+        dec_home = float(decimals[home_idx])
 
         ml_away = _decimal_to_american(dec_away)
         ml_home = _decimal_to_american(dec_home)
@@ -287,7 +273,7 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str
         }
 
     cache_file.write_text(json.dumps({"_ts": now, "data": out}), encoding="utf-8")
-    log.info(f"[odds] DK games mapped for {local_date}: {len(out)}")
+    logging.getLogger(__name__).info(f"[odds] DK games mapped for {local_date}: {len(out)}")
     return out
 BACKTEST_CSV = "backtest_results.csv"
 BACKTEST_SUMMARY_JSON = "backtest_summary.json"
@@ -704,8 +690,6 @@ def get_or_build_elo_cached(end_date):
 # =========================
 def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> List[Dict[str, Any]]:
     games = get_schedule_for_local_date(local_date)
-    # Pull DraftKings odds once per page build (cached + rate-limited)
-    dk_map = get_draftkings_h2h_for_date(local_date)
     preds = []
     for g in games:
         home_key, away_key = g.home_key, g.away_key
@@ -739,23 +723,23 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
             "local_time": fmt_local_time(_utc_to_local_dt(g.start_utc_str, LOCAL_TZ)),
             "utc_time": g.start_utc_str,
             "game_type": g.game_type or "",
-            # DraftKings odds (if available)
-            "dk_ml_away_str": "—",
-            "dk_ml_home_str": "—",
-            "dk_imp_away_str": "—",
-            "dk_imp_home_str": "—",
         })
-        # Attach DK odds via away@home key
-        k = f"{away_key}@{home_key}"
-        dk = dk_map.get(k)
-        if dk:
-            preds[-1]["dk_ml_away_str"] = _fmt_american(dk.get("ml_away"))
-            preds[-1]["dk_ml_home_str"] = _fmt_american(dk.get("ml_home"))
+    # Auto-tag a single "Best Bet": highest positive edge (model vs DK no-vig) above threshold
+    best_idx = None
+    best_edge = 0.0
+    best_side = ""
+    for i, p in enumerate(preds):
+        ea = p.get("dk_edge_away")
+        eh = p.get("dk_edge_home")
+        # pick the better side for this game
+        if isinstance(ea, (int, float)) and ea > best_edge:
+            best_edge = float(ea); best_idx = i; best_side = "AWAY"
+        if isinstance(eh, (int, float)) and eh > best_edge:
+            best_edge = float(eh); best_idx = i; best_side = "HOME"
+    if best_idx is not None and best_edge >= ODDS_BEST_BET_MIN_EDGE_PCT:
+        preds[best_idx]["best_bet"] = "BEST BET"
+        preds[best_idx]["best_bet_side"] = best_side
 
-            pa = dk.get("p_novig_away")
-            ph = dk.get("p_novig_home")
-            preds[-1]["dk_imp_away_str"] = f"{pa*100:.1f}%" if isinstance(pa, (int, float)) else "—"
-            preds[-1]["dk_imp_home_str"] = f"{ph*100:.1f}%" if isinstance(ph, (int, float)) else "—"
     return preds
 
 def write_csv(rows, path):
@@ -1045,7 +1029,7 @@ h1{font-weight:800;margin:0 0 16px}
             f.write(html)
         return
 
-    def row_html(p):
+        def row_html(p):
         ph = f"{p['p_home_win'] * 100:.1f}%"
         pa = f"{p['p_away_win'] * 100:.1f}%"
         alts_home = p.get("home_logo_alts", "[]")
@@ -1053,13 +1037,39 @@ h1{font-weight:800;margin:0 0 16px}
         home_name = p['home_key'] + (f" ({p['home_record']})" if p.get('home_record') else "")
         away_name = p['away_key'] + (f" ({p['away_record']})" if p.get('away_record') else "")
         time_str = p.get("local_time", "")
+
+        # Edge formatting + highlighting
+        ea = p.get("dk_edge_away")
+        eh = p.get("dk_edge_home")
+        ea_str = p.get("dk_edge_away_str", "—")
+        eh_str = p.get("dk_edge_home_str", "—")
+
+        edge_class_away = "edge" + (" pos" if isinstance(ea, (int, float)) and ea >= ODDS_EDGE_HIGHLIGHT_PCT else
+                                   " neg" if isinstance(ea, (int, float)) and ea <= -ODDS_EDGE_HIGHLIGHT_PCT else "")
+        edge_class_home = "edge" + (" pos" if isinstance(eh, (int, float)) and eh >= ODDS_EDGE_HIGHLIGHT_PCT else
+                                   " neg" if isinstance(eh, (int, float)) and eh <= -ODDS_EDGE_HIGHLIGHT_PCT else "")
+
+        # Mark closing line with an asterisk once game has started
+        dk_away = p.get('dk_ml_away_str', '—')
+        dk_home = p.get('dk_ml_home_str', '—')
+        if p.get("dk_is_closing") and dk_away != "—" and dk_home != "—":
+            dk_away = dk_away + "*"
+            dk_home = dk_home + "*"
+
+        # Best bet badge
+        badge = ""
+        if p.get("best_bet"):
+            badge = f'<span class="badge">{p["best_bet"]}</span>'
+
+        tr_cls = "bestbet" if p.get("best_bet") else ""
+
         return f"""
-<tr>
+<tr class="{tr_cls}">
   <td class="teams">
     <div class="team">
       <img class="logo" src="{p['away_logo']}" data-alts='{alts_away}' alt="{p['away_key']}" loading="lazy"/>
       <div class="meta">
-        <div class="abbr">{away_name}</div>
+        <div class="abbr">{away_name} {badge}</div>
       </div>
     </div>
     <div class="vs">at <span class="time" data-utc="{p.get('utc_time','')}">{time_str}</span></div>
@@ -1080,12 +1090,16 @@ h1{font-weight:800;margin:0 0 16px}
     <div>Home: <b>{p['ml_home']:+d}</b></div>
   </td>
   <td class="dkml" data-label="DK ML">
-    <div>Away: <b>{p.get('dk_ml_away_str','—')}</b></div>
-    <div>Home: <b>{p.get('dk_ml_home_str','—')}</b></div>
+    <div>Away: <b>{dk_away}</b></div>
+    <div>Home: <b>{dk_home}</b></div>
   </td>
   <td class="dkimp" data-label="DK Imp%">
     <div>Away: <b>{p.get('dk_imp_away_str','—')}</b></div>
     <div>Home: <b>{p.get('dk_imp_home_str','—')}</b></div>
+  </td>
+  <td class="dkedge" data-label="Edge">
+    <div class="{edge_class_away}">Away: <b>{ea_str}</b></div>
+    <div class="{edge_class_home}">Home: <b>{eh_str}</b></div>
   </td>
   <td class="xg" data-label="xG">
     <div>Away xG: <b>{p['pred_xg_away']:.2f}</b></div>
@@ -1127,6 +1141,11 @@ tbody td{padding:12px 10px;vertical-align:middle}
 .vs .time{font-weight:700;color:#fff;margin-left:6px}
 .prob,.ml,.xg{white-space:nowrap}
 b{color:#fff}
+.badge{display:inline-block;margin-left:8px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.2px;color:#0b1020;background:var(--accent)}
+tr.bestbet{background:rgba(122,162,255,.08);border-color:var(--accent)}
+.edge.pos b{color:#9fffb1}
+.edge.neg b{color:#ffb1b1}
+.dkedge{white-space:nowrap}
 .note{margin-top:10px;color:var(--muted);font-size:12px}
 .footer{color:var(--muted);font-size:12px;margin-top:16px;text-align:left;opacity:1;line-height:1.5}
 .footer a{color:var(--accent);text-decoration:underline;font-weight:600}
@@ -1141,8 +1160,8 @@ b{color:#fff}
   .team{gap:8px}
   .team img.logo{width:28px;height:28px}
   .vs{margin:6px 0 4px;font-size:11px}
-  td.prob,td.ml,td.dkml,td.dkimp,td.xg{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 8px;white-space:normal}
-  td.prob::before,td.ml::before,td.dkml::before,td.dkimp::before,td.xg::before{content:attr(data-label);color:var(--muted);font-weight:700;letter-spacing:.2px}
+  td.prob,td.ml,td.xg{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 8px;white-space:normal}
+  td.prob::before,td.ml::before,td.xg::before{content:attr(data-label);color:var(--muted);font-weight:700;letter-spacing:.2px}
 }
 </style>
 </head>
@@ -1154,7 +1173,7 @@ b{color:#fff}
       <a href="/standings">Standings</a>
     </div>
     %%SEASONLINE%%
-    <div class="subtitle">Implied moneylines are vig-free (fair odds) derived from model probabilities.</div>
+    <div class="subtitle">Implied moneylines are vig-free (fair odds) derived from model probabilities. Edge highlights show model probability minus DraftKings no-vig implied probability. DK lines shown with * are treated as closing once the game has started.</div>
     <div class="table-card">
       <table>
         <thead>
@@ -1164,6 +1183,7 @@ b{color:#fff}
             <th>Implied ML</th>
             <th>DK ML</th>
             <th>DK Imp%</th>
+            <th>Edge</th>
             <th>xG</th>
           </tr>
         </thead>
