@@ -246,7 +246,7 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str
             continue
 
         sites = ev.get("sites") or ev.get("bookmakers") or []
-        dk = next((s for s in sites if (s.get("site_key") or s.get("key")) == "draftkings", None))
+        dk = next((s for s in sites if (s.get("site_key") or s.get("key")) == "draftkings"), None)
         if not dk:
             continue
 
