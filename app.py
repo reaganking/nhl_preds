@@ -53,7 +53,7 @@ ELO_DUMP_CSV = "elo_dump.csv"
 #   ODDS_API_KEY
 #   ODDS_TTL_SECONDS (default 14400 = 4h)
 #   ODDS_MAX_CALLS_PER_DAY (default 6)
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
+ODDS_API_KEY = os.environ.get("THE_ODDS_API_KEY") or os.environ.get("ODDS_API_KEY") or ""
 ODDS_TTL_SECONDS = int(os.environ.get("ODDS_TTL_SECONDS", str(4 * 60 * 60)))
 ODDS_MAX_CALLS_PER_DAY = int(os.environ.get("ODDS_MAX_CALLS_PER_DAY", "6"))
 
@@ -103,6 +103,28 @@ TEAM_NAME_TO_ABBR = {
     "utah hockey club": "UTA",
     "utah": "UTA",
 }
+
+
+def _odds_team_to_abbr(team_name: str) -> Optional[str]:
+    """
+    Convert a team name from The Odds API into our 3-letter NHL abbreviation.
+    Handles accents, punctuation, and common variants.
+    """
+    key = _norm_team_name(team_name)
+    if not key:
+        return None
+    abbr = TEAM_NAME_TO_ABBR.get(key)
+    if abbr:
+        return abbr
+
+    # Extra light cleanup for edge cases (e.g., "St. Louis Blues" vs "St Louis Blues")
+    key2 = key.replace("st. ", "st ").replace("st louis", "st louis")
+    abbr = TEAM_NAME_TO_ABBR.get(key2)
+    if abbr:
+        return abbr
+
+    return None
+
 
 def _norm_team_name(s: str) -> str:
     s = (s or "").strip().lower()
@@ -300,11 +322,11 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[Tuple[str, st
 
         # Fallback: normalized lookup (handles accents/punctuation)
         if ml_home is None or ml_away is None:
-            norm_map = { _norm_team(k): v for k, v in price_by_team.items() }
+            norm_map = { _norm_team_name(k): v for k, v in price_by_team.items() }
             if ml_home is None:
-                ml_home = norm_map.get(_norm_team(home_name))
+                ml_home = norm_map.get(_norm_team_name(home_name))
             if ml_away is None:
-                ml_away = norm_map.get(_norm_team(away_name))
+                ml_away = norm_map.get(_norm_team_name(away_name))
 
         if ml_home is None or ml_away is None:
             continue
@@ -784,8 +806,7 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
             "utc_time": g.start_utc_str,
             "game_type": g.game_type or "",
         })
-    # ---- Attach DraftKings odds + model edge (if available) ----
-
+        # ---- Attach DraftKings odds + model edge (if available) ----
     dk_odds = get_draftkings_h2h_for_date(local_date)
     now_utc = datetime.now(tz=timezone.utc)
 
@@ -797,9 +818,16 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
         # defaults so templates never KeyError
         p.setdefault("dk_ml_away_str", "—")
         p.setdefault("dk_ml_home_str", "—")
+        p["dk_is_closing"] = False
+
         p["dk_edge_away"] = None
         p["dk_edge_home"] = None
-        p["dk_is_closing"] = False
+        p["dk_edge_away_str"] = "—"
+        p["dk_edge_home_str"] = "—"
+
+        # "value" flags (star) — TRUE when edge >= threshold
+        p["dk_value_away"] = False
+        p["dk_value_home"] = False
 
         # mark "closing" once the game has started (based on schedule UTC time)
         try:
@@ -821,25 +849,15 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
 
         # Edge = (model win prob) - (DK no-vig implied prob)
         if isinstance(p_nv_a, (int, float)):
-            p["dk_edge_away"] = float(p.get("p_away_win", 0.0)) - float(p_nv_a)
+            ea = float(p.get("p_away_win", 0.0)) - float(p_nv_a)
+            p["dk_edge_away"] = ea
+            p["dk_edge_away_str"] = f"{ea*100:+.1f}%"
+            p["dk_value_away"] = ea >= ODDS_EDGE_HIGHLIGHT_PCT
         if isinstance(p_nv_h, (int, float)):
-            p["dk_edge_home"] = float(p.get("p_home_win", 0.0)) - float(p_nv_h)
-
-    # Auto-tag a single "Best Bet": highest positive edge (model vs DK no-vig) above threshold
-    best_idx = None
-    best_edge = 0.0
-    best_side = ""
-    for i, p in enumerate(preds):
-        ea = p.get("dk_edge_away")
-        eh = p.get("dk_edge_home")
-        # pick the better side for this game
-        if isinstance(ea, (int, float)) and ea > best_edge:
-            best_edge = float(ea); best_idx = i; best_side = "AWAY"
-        if isinstance(eh, (int, float)) and eh > best_edge:
-            best_edge = float(eh); best_idx = i; best_side = "HOME"
-    if best_idx is not None and best_edge >= ODDS_BEST_BET_MIN_EDGE_PCT:
-        preds[best_idx]["best_bet"] = "BEST BET"
-        preds[best_idx]["best_bet_side"] = best_side
+            eh = float(p.get("p_home_win", 0.0)) - float(p_nv_h)
+            p["dk_edge_home"] = eh
+            p["dk_edge_home_str"] = f"{eh*100:+.1f}%"
+            p["dk_value_home"] = eh >= ODDS_EDGE_HIGHLIGHT_PCT
 
     return preds
 
@@ -1159,16 +1177,16 @@ h1{font-weight:800;margin:0 0 16px}
         # Mark closing line with an asterisk once game has started
         dk_away = p.get('dk_ml_away_str', '—')
         dk_home = p.get('dk_ml_home_str', '—')
+
+        # Mark VALUE sides with a star (model edge vs DK no-vig)
+        if p.get('dk_value_away') and dk_away != '—':
+            dk_away = f"{dk_away} ★"
+        if p.get('dk_value_home') and dk_home != '—':
+            dk_home = f"{dk_home} ★"
         if p.get("dk_is_closing") and dk_away != "—" and dk_home != "—":
             dk_away = dk_away + "*"
             dk_home = dk_home + "*"
-
-        # Best bet badge
-        badge = ""
-        if p.get("best_bet"):
-            badge = f'<span class="badge">{p["best_bet"]}</span>'
-
-        tr_cls = "bestbet" if p.get("best_bet") else ""
+        tr_cls = ""
 
         return f"""
 <tr class="{tr_cls}">
@@ -1176,7 +1194,7 @@ h1{font-weight:800;margin:0 0 16px}
     <div class="team">
       <img class="logo" src="{p['away_logo']}" data-alts='{alts_away}' alt="{p['away_key']}" loading="lazy"/>
       <div class="meta">
-        <div class="abbr">{away_name} {badge}</div>
+        <div class="abbr">{away_name}</div>
       </div>
     </div>
     <div class="vs">at <span class="time" data-utc="{p.get('utc_time','')}">{time_str}</span></div>
@@ -1199,10 +1217,6 @@ h1{font-weight:800;margin:0 0 16px}
   <td class="dkml" data-label="DK ML">
     <div>Away: <b>{dk_away}</b></div>
     <div>Home: <b>{dk_home}</b></div>
-  </td>
-  <td class="dkimp" data-label="DK Imp%">
-    <div>Away: <b>{p.get('dk_imp_away_str','—')}</b></div>
-    <div>Home: <b>{p.get('dk_imp_home_str','—')}</b></div>
   </td>
   <td class="dkedge" data-label="Edge">
     <div class="{edge_class_away}">Away: <b>{ea_str}</b></div>
@@ -1248,7 +1262,6 @@ tbody td{padding:12px 10px;vertical-align:middle}
 .prob,.ml,.xg{white-space:nowrap}
 b{color:#fff}
 .badge{display:inline-block;margin-left:8px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.2px;color:#0b1020;background:var(--accent)}
-tr.bestbet{background:rgba(122,162,255,.08);border-color:var(--accent)}
 .edge.pos b{color:#9fffb1}
 .edge.neg b{color:#ffb1b1}
 .dkedge{white-space:nowrap}
@@ -1279,7 +1292,7 @@ tr.bestbet{background:rgba(122,162,255,.08);border-color:var(--accent)}
       <a href="/standings">Standings</a>
     </div>
     %%SEASONLINE%%
-    <div class="subtitle">Implied moneylines are vig-free (fair odds) derived from model probabilities. Edge highlights show model probability minus DraftKings no-vig implied probability. DK lines shown with * are treated as closing once the game has started.</div>
+    <div class="subtitle">Implied moneylines are vig-free (fair odds) derived from model probabilities. Edge highlights show model probability minus DraftKings no-vig implied probability. ★ indicates model edge ≥ threshold. DK lines shown with * are treated as closing once the game has started.</div>
     <div class="table-card">
       <table>
         <thead>
@@ -1288,14 +1301,13 @@ tr.bestbet{background:rgba(122,162,255,.08);border-color:var(--accent)}
             <th>Win Prob</th>
             <th>Implied ML</th>
             <th>DK ML</th>
-            <th>DK Imp%</th>
-            <th>Edge</th>
+                        <th>Edge</th>
             <th>xG</th>
           </tr>
         </thead>
         <tbody>%%ROWS%%</tbody>
       </table>
-      <div class="note">xG = expected goals.</div>
+      <div class="note">★ = value (model edge ≥ threshold). * = line considered closing after game start. xG = expected goals.</div>
     </div>
     <div class="footer">
       <div>Last updated at: <strong>%%UPDATED%%</strong></div>
