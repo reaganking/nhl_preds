@@ -1029,49 +1029,47 @@ h1{font-weight:800;margin:0 0 16px}
             f.write(html)
         return
 
-        def row_html(p):
-            ph = f"{p['p_home_win'] * 100:.1f}%"
-            pa = f"{p['p_away_win'] * 100:.1f}%"
+    def row_html(p):
+        ph = f"{p['p_home_win'] * 100:.1f}%"
+        pa = f"{p['p_away_win'] * 100:.1f}%"
+        alts_home = p.get("home_logo_alts", "[]")
+        alts_away = p.get("away_logo_alts", "[]")
+        home_name = p['home_key'] + (f" ({p['home_record']})" if p.get('home_record') else "")
+        away_name = p['away_key'] + (f" ({p['away_record']})" if p.get('away_record') else "")
+        time_str = p.get("local_time", "")
 
-            alts_home = p.get("home_logo_alts", "[]")
-            alts_away = p.get("away_logo_alts", "[]")
+        # Edge formatting + highlighting
+        ea = p.get("dk_edge_away")
+        eh = p.get("dk_edge_home")
+        ea_str = p.get("dk_edge_away_str", "—")
+        eh_str = p.get("dk_edge_home_str", "—")
 
-            home_name = p["home_key"] + (f" ({p['home_record']})" if p.get("home_record") else "")
-            away_name = p["away_key"] + (f" ({p['away_record']})" if p.get("away_record") else "")
-            time_str = p.get("local_time", "")
+        edge_class_away = "edge" + (
+            " pos" if isinstance(ea, (int, float)) and ea >= ODDS_EDGE_HIGHLIGHT_PCT else
+            " neg" if isinstance(ea, (int, float)) and ea <= -ODDS_EDGE_HIGHLIGHT_PCT else
+            ""
+        )
+        edge_class_home = "edge" + (
+            " pos" if isinstance(eh, (int, float)) and eh >= ODDS_EDGE_HIGHLIGHT_PCT else
+            " neg" if isinstance(eh, (int, float)) and eh <= -ODDS_EDGE_HIGHLIGHT_PCT else
+            ""
+        )
 
-            # Edge formatting + highlighting
-            ea = p.get("dk_edge_away")
-            eh = p.get("dk_edge_home")
-            ea_str = p.get("dk_edge_away_str", "—")
-            eh_str = p.get("dk_edge_home_str", "—")
+        # Mark closing line with an asterisk once game has started
+        dk_away = p.get('dk_ml_away_str', '—')
+        dk_home = p.get('dk_ml_home_str', '—')
+        if p.get("dk_is_closing") and dk_away != "—" and dk_home != "—":
+            dk_away = dk_away + "*"
+            dk_home = dk_home + "*"
 
-            edge_class_away = (
-                "edge pos" if isinstance(ea, (int, float)) and ea >= ODDS_EDGE_HIGHLIGHT_PCT
-                else "edge neg" if isinstance(ea, (int, float)) and ea <= -ODDS_EDGE_HIGHLIGHT_PCT
-                else "edge"
-            )
-            edge_class_home = (
-                "edge pos" if isinstance(eh, (int, float)) and eh >= ODDS_EDGE_HIGHLIGHT_PCT
-                else "edge neg" if isinstance(eh, (int, float)) and eh <= -ODDS_EDGE_HIGHLIGHT_PCT
-                else "edge"
-            )
+        # Best bet badge
+        badge = ""
+        if p.get("best_bet"):
+            badge = f'<span class="badge">{p["best_bet"]}</span>'
 
-            # Mark closing line with an asterisk once game has started
-            dk_away = p.get("dk_ml_away_str", "—")
-            dk_home = p.get("dk_ml_home_str", "—")
-            if p.get("dk_is_closing") and dk_away != "—" and dk_home != "—":
-                dk_away += "*"
-                dk_home += "*"
+        tr_cls = "bestbet" if p.get("best_bet") else ""
 
-            # Best bet badge
-            badge = ""
-            if p.get("best_bet"):
-                badge = f'<span class="badge">{p["best_bet"]}</span>'
-
-            tr_cls = "bestbet" if p.get("best_bet") else ""
-
-            return f"""
+        return f"""
 <tr class="{tr_cls}">
   <td class="teams">
     <div class="team">
@@ -1080,9 +1078,7 @@ h1{font-weight:800;margin:0 0 16px}
         <div class="abbr">{away_name} {badge}</div>
       </div>
     </div>
-
     <div class="vs">at <span class="time" data-utc="{p.get('utc_time','')}">{time_str}</span></div>
-
     <div class="team home">
       <img class="logo" src="{p['home_logo']}" data-alts='{alts_home}' alt="{p['home_key']}" loading="lazy"/>
       <div class="meta">
@@ -1095,33 +1091,27 @@ h1{font-weight:800;margin:0 0 16px}
     <div>Away: <b>{pa}</b></div>
     <div>Home: <b>{ph}</b></div>
   </td>
-
   <td class="ml" data-label="Implied ML">
     <div>Away: <b>{p['ml_away']:+d}</b></div>
     <div>Home: <b>{p['ml_home']:+d}</b></div>
   </td>
-
   <td class="dkml" data-label="DK ML">
     <div>Away: <b>{dk_away}</b></div>
     <div>Home: <b>{dk_home}</b></div>
   </td>
-
   <td class="dkimp" data-label="DK Imp%">
     <div>Away: <b>{p.get('dk_imp_away_str','—')}</b></div>
     <div>Home: <b>{p.get('dk_imp_home_str','—')}</b></div>
   </td>
-
   <td class="dkedge" data-label="Edge">
     <div class="{edge_class_away}">Away: <b>{ea_str}</b></div>
     <div class="{edge_class_home}">Home: <b>{eh_str}</b></div>
   </td>
-
   <td class="xg" data-label="xG">
     <div>Away xG: <b>{p['pred_xg_away']:.2f}</b></div>
     <div>Home xG: <b>{p['pred_xg_home']:.2f}</b></div>
   </td>
 </tr>"""
-
     rows_html = "\n".join(row_html(p) for p in preds)
 
     html = """
