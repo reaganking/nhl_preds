@@ -12,6 +12,7 @@ import logging
 import random
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -164,23 +165,41 @@ def _record_odds_call(local_date: datetime.date) -> None:
     data["calls"] = int(data.get("calls", 0)) + 1
     calls_file.write_text(json.dumps(data), encoding="utf-8")
 
-def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str, Any]]:
+
+def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[Tuple[str, str], Dict[str, Any]]:
     """
-    Returns a dict keyed by (away_abbr, home_abbr) with DK decimals, American ML, and implied probs.
-    Cached to /tmp with TTL and a daily max-call guard to protect free-tier limits.
+    Fetch DraftKings moneylines (h2h) for NHL from The Odds API (v4) and return a dict keyed by:
+      (away_abbr, home_abbr)
+
+    Values include:
+      - dk_ml_away (int), dk_ml_home (int)  [American odds]
+      - dk_ml_away_str / dk_ml_home_str (formatted strings)
+      - dk_p_novig_away / dk_p_novig_home (no-vig implied probabilities)
+      - commence_time (ISO string)
+      - dk_found (bool)
+
+    Cached to /tmp with TTL and a daily max-call guard (free-tier friendly).
     """
-    if not ODDS_API_KEY:
+    api_key = os.environ.get("THE_ODDS_API_KEY") or os.environ.get("ODDS_API_KEY") or ""
+    if not api_key:
         return {}
 
     cache_file, _ = _odds_cache_paths(local_date)
-    now = datetime.now(tz=timezone.utc).timestamp()
+    now_ts = datetime.now(tz=timezone.utc).timestamp()
 
     # 1) Fresh cache
     if cache_file.exists():
         try:
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            if (now - float(cached.get("_ts", 0))) < ODDS_TTL_SECONDS:
-                return cached.get("data", {}) or {}
+            if (now_ts - float(cached.get("_ts", 0))) < ODDS_TTL_SECONDS:
+                data = cached.get("data", {}) or {}
+                # keys were serialized as "AWAY@HOME" to keep JSON-safe
+                out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+                for k, v in data.items():
+                    if isinstance(k, str) and "@" in k:
+                        a, h = k.split("@", 1)
+                        out[(a, h)] = v
+                return out
         except Exception:
             pass
 
@@ -189,94 +208,135 @@ def get_draftkings_h2h_for_date(local_date: datetime.date) -> Dict[str, Dict[str
         if cache_file.exists():
             try:
                 cached = json.loads(cache_file.read_text(encoding="utf-8"))
-                return cached.get("data", {}) or {}
+                data = cached.get("data", {}) or {}
+                out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+                for k, v in data.items():
+                    if isinstance(k, str) and "@" in k:
+                        a, h = k.split("@", 1)
+                        out[(a, h)] = v
+                return out
             except Exception:
                 return {}
         return {}
 
-    # 3) Call API (v3 payload shape)
+    # 3) Call The Odds API v4
     _record_odds_call(local_date)
-    params = {
-        "api_key": ODDS_API_KEY,
-        "sport": "icehockey_nhl",
-        "region": "us",
-        "mkt": "h2h",
-        "oddsFormat": "decimal",
-        "dateFormat": "unix",
-    }
-    resp = requests.get(ODDS_API_V3_URL, params=params, timeout=15)
-    resp.raise_for_status()
-    payload = resp.json()
 
-    events = payload.get("data", []) if isinstance(payload, dict) else payload
+    base = "https://api.the-odds-api.com/v4"
+    sport_key = "icehockey_nhl"
+    params = {
+        "apiKey": api_key,
+        "regions": "us",
+        "markets": "h2h",
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+        "bookmakers": "draftkings",
+    }
+
+    resp = requests.get(f"{base}/sports/{sport_key}/odds", params=params, timeout=25)
+    resp.raise_for_status()
+    events = resp.json()
     if not isinstance(events, list):
         events = []
 
-    out: Dict[str, Dict[str, Any]] = {}
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    def american_to_decimal(ml: int) -> Optional[float]:
+        try:
+            ml = int(ml)
+        except Exception:
+            return None
+        if ml == 0:
+            return None
+        if ml > 0:
+            return 1.0 + (ml / 100.0)
+        return 1.0 + (100.0 / abs(ml))
 
     for ev in events:
         if not isinstance(ev, dict):
             continue
 
-        ct = ev.get("commence_time")
-        if not ct:
-            continue
-
-        dt_utc = datetime.fromtimestamp(int(ct), tz=timezone.utc)
-        dt_local = dt_utc.astimezone(LOCAL_TZ)
-        if dt_local.date() != local_date:
-            continue
-
         home_name = ev.get("home_team")
-        teams = ev.get("teams") or []
-        if not home_name or len(teams) != 2:
+        away_name = ev.get("away_team")
+        if not home_name or not away_name:
             continue
 
-        away_name = teams[0] if teams[1] == home_name else teams[1]
-
-        home_abbr = TEAM_NAME_TO_ABBR.get(_norm_team_name(home_name))
-        away_abbr = TEAM_NAME_TO_ABBR.get(_norm_team_name(away_name))
+        home_abbr = _odds_team_to_abbr(home_name)
+        away_abbr = _odds_team_to_abbr(away_name)
         if not home_abbr or not away_abbr:
             continue
 
-        sites = ev.get("sites") or ev.get("bookmakers") or []
-        dk = next((s for s in sites if (s.get("site_key") or s.get("key")) == "draftkings"), None)
+        dk = None
+        for b in (ev.get("bookmakers") or []):
+            if not isinstance(b, dict):
+                continue
+            if (b.get("key") or "").lower() == "draftkings" or (b.get("title") or "").lower() == "draftkings":
+                dk = b
+                break
         if not dk:
             continue
 
-        decimals = None
-        if isinstance(dk.get("odds"), dict) and isinstance(dk["odds"].get("h2h"), list):
-            decimals = dk["odds"]["h2h"]
-
-        if not decimals or len(decimals) != 2:
+        h2h = None
+        for mkt in (dk.get("markets") or []):
+            if isinstance(mkt, dict) and mkt.get("key") == "h2h":
+                h2h = mkt
+                break
+        if not h2h:
             continue
 
-        # Odds API v3 aligns h2h order with "teams" order
-        away_idx = 0 if teams[0] == away_name else 1
-        home_idx = 0 if teams[0] == home_name else 1
+        price_by_team = {}
+        for o in (h2h.get("outcomes") or []):
+            if not isinstance(o, dict):
+                continue
+            name = o.get("name")
+            price = o.get("price")
+            if name is None or price is None:
+                continue
+            price_by_team[str(name)] = price
 
-        dec_away = float(decimals[away_idx])
-        dec_home = float(decimals[home_idx])
+        # Direct lookup by exact names
+        ml_home = price_by_team.get(home_name)
+        ml_away = price_by_team.get(away_name)
 
-        ml_away = _decimal_to_american(dec_away)
-        ml_home = _decimal_to_american(dec_home)
+        # Fallback: normalized lookup (handles accents/punctuation)
+        if ml_home is None or ml_away is None:
+            norm_map = { _norm_team(k): v for k, v in price_by_team.items() }
+            if ml_home is None:
+                ml_home = norm_map.get(_norm_team(home_name))
+            if ml_away is None:
+                ml_away = norm_map.get(_norm_team(away_name))
+
+        if ml_home is None or ml_away is None:
+            continue
+
+        # No-vig implied probs (convert to decimals to reuse existing helpers)
+        dec_home = american_to_decimal(ml_home)
+        dec_away = american_to_decimal(ml_away)
+        if dec_home is None or dec_away is None:
+            continue
 
         p_nv_away, p_nv_home = _no_vig_probs(dec_away, dec_home)
 
-        out[f"{away_abbr}@{home_abbr}"] = {
-            "dec_away": dec_away,
-            "dec_home": dec_home,
-            "ml_away": ml_away,
-            "ml_home": ml_home,
-            "p_novig_away": p_nv_away,
-            "p_novig_home": p_nv_home,
+        out[(away_abbr, home_abbr)] = {
+            "dk_ml_away": int(ml_away),
+            "dk_ml_home": int(ml_home),
+            "dk_ml_away_str": _fmt_american(int(ml_away)),
+            "dk_ml_home_str": _fmt_american(int(ml_home)),
+            "dk_p_novig_away": p_nv_away,
+            "dk_p_novig_home": p_nv_home,
+            "commence_time": ev.get("commence_time"),
+            "dk_found": True,
         }
 
-    cache_file.write_text(json.dumps({"_ts": now, "data": out}), encoding="utf-8")
-    logging.getLogger(__name__).info(f"[odds] DK games mapped for {local_date}: {len(out)}")
+    # 4) Save cache (JSON-safe keys)
+    try:
+        serial = { f"{a}@{h}": v for (a, h), v in out.items() }
+        cache_file.write_text(json.dumps({"_ts": now_ts, "data": serial}), encoding="utf-8")
+    except Exception:
+        pass
+
     return out
-BACKTEST_CSV = "backtest_results.csv"
-BACKTEST_SUMMARY_JSON = "backtest_summary.json"
+
 
 API_BASE = "https://api-web.nhle.com"
 API_SCHEDULE_DATE = API_BASE + "/v1/schedule/{date}"   # YYYY-MM-DD (returns a week bucket)
@@ -724,6 +784,47 @@ def predict_day(state, local_date: datetime.date, records: Dict[str, str]) -> Li
             "utc_time": g.start_utc_str,
             "game_type": g.game_type or "",
         })
+    # ---- Attach DraftKings odds + model edge (if available) ----
+
+    dk_odds = get_draftkings_h2h_for_date(local_date)
+    now_utc = datetime.now(tz=timezone.utc)
+
+    for p in preds:
+        a = p.get("away_key")
+        h = p.get("home_key")
+        dk = dk_odds.get((a, h)) if a and h else None
+
+        # defaults so templates never KeyError
+        p.setdefault("dk_ml_away_str", "—")
+        p.setdefault("dk_ml_home_str", "—")
+        p["dk_edge_away"] = None
+        p["dk_edge_home"] = None
+        p["dk_is_closing"] = False
+
+        # mark "closing" once the game has started (based on schedule UTC time)
+        try:
+            start_dt = datetime.fromisoformat(str(p.get("utc_time")).replace("Z", "+00:00"))
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            p["dk_is_closing"] = now_utc >= start_dt
+        except Exception:
+            pass
+
+        if not dk:
+            continue
+
+        p["dk_ml_away_str"] = dk.get("dk_ml_away_str", "—")
+        p["dk_ml_home_str"] = dk.get("dk_ml_home_str", "—")
+
+        p_nv_a = dk.get("dk_p_novig_away")
+        p_nv_h = dk.get("dk_p_novig_home")
+
+        # Edge = (model win prob) - (DK no-vig implied prob)
+        if isinstance(p_nv_a, (int, float)):
+            p["dk_edge_away"] = float(p.get("p_away_win", 0.0)) - float(p_nv_a)
+        if isinstance(p_nv_h, (int, float)):
+            p["dk_edge_home"] = float(p.get("p_home_win", 0.0)) - float(p_nv_h)
+
     # Auto-tag a single "Best Bet": highest positive edge (model vs DK no-vig) above threshold
     best_idx = None
     best_edge = 0.0
